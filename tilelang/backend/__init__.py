@@ -38,6 +38,7 @@ register_lazy_execution_backends("hip", "tilelang.rocm.execution_backend")
 register_lazy_execution_backends("c", "tilelang.cpu.execution_backend")
 register_lazy_execution_backends("llvm", "tilelang.cpu.execution_backend")
 register_lazy_execution_backends("metal", "tilelang.metal.execution_backend")
+register_lazy_execution_backends("tpu", "tilelang.tpu.execution_backend")
 
 register_lazy_device_codegen("cuda", "tilelang.cuda.codegen")
 register_lazy_device_codegen("hip", "tilelang.rocm.codegen")
@@ -45,9 +46,11 @@ register_lazy_device_codegen("c", "tilelang.cpu.codegen")
 register_lazy_device_codegen("llvm", "tilelang.cpu.codegen")
 register_lazy_device_codegen("metal", "tilelang.metal.codegen")
 register_lazy_device_codegen("webgpu", "tilelang.webgpu.codegen")
+register_lazy_device_codegen("tpu", "tilelang.tpu.codegen")
 
 register_lazy_host_codegen("c", "tilelang.cpu.codegen")
 register_lazy_host_codegen("llvm", "tilelang.cpu.codegen")
+register_lazy_host_codegen("tpu", "tilelang.tpu.codegen")
 register_lazy_host_codegen_hooks("metal", "tilelang.metal.codegen")
 
 from . import common as common  # noqa: F401,E402

@@ -5,6 +5,10 @@ from . import pipeline  # noqa: F401
 from . import execution_backend  # noqa: F401
 from . import ppl_runner  # noqa: F401
 from . import compiler  # noqa: F401
+from . import adapter  # noqa: F401
+from . import cache  # noqa: F401
 
 from .compiler import compile, compile_gemm  # noqa: F401
 from .ppl_runner import PPLGemmSpec, PPLKernel, build, emit_pl  # noqa: F401
+from .adapter import PPLKernelAdapter  # noqa: F401
+from .cache import PPLKernelCache  # noqa: F401

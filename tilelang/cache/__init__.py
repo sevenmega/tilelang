@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 TargetLike = str | dict[str, object] | TVMTarget
 
 # Create a map of singleton instance of KernelCaches
+def _make_ppl_cache():
+    from tilelang.tpu.cache import PPLKernelCache
+    return PPLKernelCache()
+
+
 _dispatch_map: dict[str, KernelCache] = {
     "tvm_ffi": TVMFFIKernelCache(),
     "cython": CythonKernelCache(),
@@ -29,9 +34,15 @@ _dispatch_map: dict[str, KernelCache] = {
 }
 
 
+def _resolve_cache_dispatch_ppl():
+    if "ppl" not in _dispatch_map:
+        _dispatch_map["ppl"] = _make_ppl_cache()
+    return _dispatch_map["ppl"]
+
+
 def _resolve_cache_dispatch(
     target: TargetLike | None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ppl"] | None,
     verbose: bool | None,
 ):
     if target is None:
@@ -59,6 +70,8 @@ def _resolve_cache_dispatch(
                 norm_target.kind.name,
                 ", ".join(sorted(allowed_now)),
             )
+    if resolved_backend == "ppl":
+        return _resolve_cache_dispatch_ppl(), norm_target, resolved_backend, verbose
     if resolved_backend not in _dispatch_map:
         raise ValueError(f'Cannot find support for execution backend "{resolved_backend}"')
     return _dispatch_map[resolved_backend], norm_target, resolved_backend, verbose
@@ -70,7 +83,7 @@ def cached(
     *args,
     target: TargetLike | None = None,
     target_host: TargetLike | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ppl"] | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,

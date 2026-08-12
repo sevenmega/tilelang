@@ -43,3 +43,19 @@ kernel = matmul_naive.compile(M=M, N=N, K=K)
 print("TPU Kernel Source:")
 print(kernel.get_kernel_source())
 print("\nNaive GEMM+ReLU compilation for TPU target succeeded.")
+
+# Optional: run on hardware if PPL toolchain is available
+if __name__ == "__main__":
+    import sys
+    if "--run" in sys.argv:
+        import torch
+        a = torch.randn(M, K, dtype=torch.float16)
+        b = torch.randn(K, N, dtype=torch.float16)
+        c = kernel(a, b)
+        ref = torch.relu(a.float() @ b.float()).half()
+        if torch.allclose(c, ref, rtol=1e-2, atol=1e-2):
+            print("PASS: TPU result matches torch reference")
+        else:
+            max_diff = (c - ref).abs().max().item()
+            print(f"FAIL: max diff = {max_diff}")
+            sys.exit(1)

@@ -540,7 +540,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             return kernel
 
 
-ExecutionBackend = Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"]
+ExecutionBackend = Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ppl"]
 
 
 @overload

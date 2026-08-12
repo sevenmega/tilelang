@@ -67,7 +67,7 @@ class JITKernel(Generic[_P, _T]):
         self,
         func: PrimFunc = None,
         out_idx: list[int] | int = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "ppl"] = "tvm_ffi",
         target: TargetLike = "auto",
         target_host: TargetLike | None = None,
         verbose: bool = False,
@@ -265,6 +265,24 @@ class JITKernel(Generic[_P, _T]):
             "target_host": str(target_host) if target_host is not None else None,
             "backend": execution_backend,
         }
+
+        # PPL backend: bypass tilelang.lower() entirely — PPL codegen
+        # pattern-matches the original PrimFunc for shapes/tiles.
+        if execution_backend == "ppl":
+            from tilelang.tpu.adapter import PPLKernelAdapter
+            from tilelang.tpu.compiler import compile as tpu_compile
+            from tilelang.engine.lower import extrac_params
+
+            with jit_phase("lower", verbose=verbose, **phase_context):
+                tpu_kernel = tpu_compile(tilelang_func, target="tpu")
+            params = extrac_params(tilelang_func)
+            adapter = PPLKernelAdapter(
+                tpu_kernel=tpu_kernel,
+                params=params,
+                result_idx=out_idx if isinstance(out_idx, list) else [out_idx] if out_idx is not None else [-1],
+            )
+            return adapter
+
         with (
             report_pass_timing_on_exit(
                 timing_instrument,
@@ -441,6 +459,8 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend == "ppl":
+            raise NotImplementedError("PPL backend does not support database reload")
         else:
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
@@ -491,7 +511,7 @@ class JITKernel(Generic[_P, _T]):
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "ppl"}:
             return self.adapter.get_kernel_source(kernel_only=kernel_only)
         return self.artifact.kernel_source
 
@@ -499,7 +519,7 @@ class JITKernel(Generic[_P, _T]):
         """
         Returns the source code of the host function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "ppl"}:
             return self.adapter.get_host_source()
         assert self.artifact.host_mod is not None, "host_mod is not available"
         return str(self.artifact.host_mod)

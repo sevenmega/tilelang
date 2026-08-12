@@ -4,6 +4,6 @@ from tilelang.backend.execution_backend import ExecutionBackendSpec, register_ex
 
 register_execution_backend(
     "tpu",
-    ExecutionBackendSpec("tvm_ffi", enable_host_codegen=True, enable_device_compile=True),
+    ExecutionBackendSpec("ppl", enable_host_codegen=False, enable_device_compile=False),
     override=True,
 )

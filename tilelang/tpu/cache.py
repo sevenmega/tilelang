@@ -14,10 +14,12 @@ from tilelang.jit import JITKernel
 class PPLKernelCache(KernelCache):
     kernel_lib_path = "kernel.so"
 
-    def _save_kernel_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
+    def _save_kernel_to_disk(self, key: str, kernel: JITKernel, func=None, verbose: bool = False):
         pass
 
-    def _load_kernel_from_disk(self, cache_path: str, **kwargs) -> JITKernel | None:
+    def _load_kernel_from_disk(self, key, target=None, target_host=None, out_idx=None,
+                               execution_backend=None, pass_configs=None,
+                               compile_flags=None, func=None, verbose=False) -> JITKernel | None:
         return None
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):

@@ -275,6 +275,10 @@ class JITKernel(Generic[_P, _T]):
 
             with jit_phase("lower", verbose=verbose, **phase_context):
                 tpu_kernel = tpu_compile(tilelang_func, target="tpu")
+
+            # Emit a lower_trace codegen record (TIR -> PPL .pl source)
+            self._emit_ppl_trace_record(tilelang_func, tpu_kernel)
+
             params = extrac_params(tilelang_func)
             adapter = PPLKernelAdapter(
                 tpu_kernel=tpu_kernel,
@@ -393,6 +397,76 @@ class JITKernel(Generic[_P, _T]):
             self._resource_usage = pop_recorded()
 
         return adapter
+
+    @staticmethod
+    def _emit_ppl_trace_record(tilelang_func, tpu_kernel):
+        """Emit a lower_trace codegen record for the PPL backend (TIR -> .pl source)."""
+        from tilelang.tools.lower_trace.core import (
+            _is_trace_enabled,
+            _records,
+            _pass_index,
+            _lock,
+            _ensure_run_dir,
+            _save_raw_files,
+            _incremental_flush_html,
+            _should_print_terminal,
+            _should_gen_html,
+            LowerRecord,
+            STATUS_CODEGEN,
+        )
+        import tilelang.tools.lower_trace.core as _trace_core
+
+        if not _is_trace_enabled():
+            return
+
+        before_text = str(tilelang_func)
+        after_text = tpu_kernel.get_kernel_source()
+
+        import difflib
+        add_count = del_count = 0
+        sm = difflib.SequenceMatcher(None, before_text.splitlines(), after_text.splitlines())
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "insert":
+                add_count += j2 - j1
+            elif tag == "delete":
+                del_count += i2 - i1
+            elif tag == "replace":
+                add_count += j2 - j1
+                del_count += i2 - i1
+
+        with _lock:
+            idx = _trace_core._pass_index
+            _trace_core._pass_index += 1
+
+            record = LowerRecord(
+                phase="codegen",
+                name="ppl_tpu",
+                index=idx,
+                before_text=before_text,
+                after_text=after_text,
+                changed=True,
+                add_lines=add_count,
+                del_lines=del_count,
+                status=STATUS_CODEGEN,
+            )
+            _records.append(record)
+
+        if _should_gen_html():
+            _ensure_run_dir()
+
+        _save_raw_files(record)
+
+        from tilelang.tools.lower_trace.core import _ANSI_CYAN, _ANSI_RESET
+        print(f"  [lower_trace] codegen/{idx:02d}_ppl_tpu: {_ANSI_CYAN}CODEGEN{_ANSI_RESET}")
+
+        if _should_gen_html():
+            import contextlib
+            with contextlib.suppress(Exception):
+                _incremental_flush_html()
+
+        if _should_print_terminal():
+            from tilelang.tools.lower_trace.diff import print_diff
+            print_diff(before_text, after_text, "codegen/ppl_tpu (TIR)", "codegen/ppl_tpu (PPL .pl)")
 
     def _create_adapter_from_database(
         self,

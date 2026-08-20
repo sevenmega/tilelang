@@ -99,6 +99,7 @@ class JITKernel(Generic[_P, _T]):
         from_database : bool, optional
             Whether to create a TorchFunction from a database.
         """
+        logger.warning("[TPU]: JITKernel->__init__")
         self.prim_func = func
         self.target_host = target_host
         self.verbose = verbose
@@ -201,6 +202,7 @@ class JITKernel(Generic[_P, _T]):
         Any
             The result of the function execution.
         """
+        logger.warning("[TPU]: JITKernel->__call__")
         return self.torch_function(*args, **kwds)
 
     def _compile_and_create_adapter(self, tilelang_func: PrimFunc, out_idx: list[int]) -> BaseKernelAdapter:
@@ -217,6 +219,7 @@ class JITKernel(Generic[_P, _T]):
         BaseKernelAdapter
             The compiled and ready-to-run kernel adapter.
         """
+        logger.warning("[TPU]: JITKernel->_compile_and_create_adapter")
         verbose = self.verbose
         target = self.target
         target_host = self.target_host

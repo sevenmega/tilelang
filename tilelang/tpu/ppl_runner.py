@@ -31,7 +31,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import logging
 
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # PPL kernel source template                                                   #
@@ -247,7 +249,7 @@ def build(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int = 2,
+    devid: int = 3,
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
@@ -255,10 +257,12 @@ def build(
 
     Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
     """
+    logger.warning("[TPU]: ppl_runner->build()")
     os.makedirs(workdir, exist_ok=True)
     pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
     with open(pl_path, "w") as f:
         f.write(emit_pl(spec))
+    logger.warning(f"[TPU]: ppl_runner->build(), emit_pl() into {pl_path}")
 
     # 1) ppl_compile.py --gen_test  ->  workdir/{lib/libkernel.so, host, include, CMakeLists.txt, ...}
     cmd = [
@@ -316,6 +320,7 @@ def build(
             wrapper_so = cand
         else:
             raise RuntimeError(f"wrapper .so not found at {wrapper_so}")
+    logger.warning(f"[TPU]: ppl_runner->build() done, kernel_so = {kernel_so}, wrapper_so = {wrapper_so}")
     return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
 
 
@@ -391,7 +396,8 @@ def _preload_real_driver() -> None:
 class PPLKernel:
     """ctypes handle to a built PPL GEMM(+ReLU) kernel on TPU."""
 
-    def __init__(self, paths: dict[str, str], *, device: int = 2, kernel_name: str = "tl_gemm_relu"):
+    def __init__(self, paths: dict[str, str], *, device: int = 3, kernel_name: str = "tl_gemm_relu"):
+        logger.warning("[TPU]: PPLKernel->__init__")
         self.paths = paths
         self.device = device
         self.kernel_name = kernel_name
@@ -411,6 +417,7 @@ class PPLKernel:
         L.py_memcpy_h2d.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
         L.py_memcpy_d2h.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
         launch = getattr(L, f"py_{kn}")
+        print(type(launch))
         launch.argtypes = [
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -448,6 +455,7 @@ class PPLKernel:
 
     def run(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """{fp16|bf16} [M,K] x [K,N] -> [M,N] (with ReLU if compiled with relu)."""
+        logger.warning("[TPU]: PPLKernel->run()")
         assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype
         M, K = a.shape
         K2, N = b.shape

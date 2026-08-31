@@ -17,17 +17,17 @@ def matmul_naive(
     B: T.Tensor((K, N), dtype)
     C = T.empty((M, N), dtype)
 
-    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-        A_shared = T.alloc_shared((block_M, block_K), dtype)
-        B_shared = T.alloc_shared((block_K, block_N), dtype)
-        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_tpu=True) as (bx, by):
+        A_local = T.alloc_local((block_M, block_K), dtype)
+        B_local = T.alloc_local((block_K, block_N), dtype)
+        C_local = T.alloc_local((block_M, block_N), accum_dtype)
 
         T.clear(C_local)
 
         for k in T.serial(T.ceildiv(K, block_K)):
-            T.copy(A[by * block_M, k * block_K], A_shared)
-            T.copy(B[k * block_K, bx * block_N], B_shared)
-            T.gemm(A_shared, B_shared, C_local)
+            T.copy(A[by * block_M, k * block_K], A_local)
+            T.copy(B[k * block_K, bx * block_N], B_local)
+            T.gemm(A_local, B_local, C_local)
 
         for i, j in T.Parallel(block_M, block_N):
             C_local[i, j] = T.max(C_local[i, j], 0)

@@ -17,7 +17,7 @@ def matmul_naive(
     B: T.Tensor((K, N), dtype)
     C = T.empty((M, N), dtype)
 
-    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_tpu=True) as (bx, by):
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M)) as (bx, by):
         A_local = T.alloc_local((block_M, block_K), dtype)
         B_local = T.alloc_local((block_K, block_N), dtype)
         C_local = T.alloc_local((block_M, block_N), accum_dtype)

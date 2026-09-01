@@ -21,6 +21,7 @@ from collections.abc import Iterable
 
 from tilelang import tvm as tvm
 from tilelang.language.eager import PrimFunc, prim_func, JITFunc
+from tilelang.language.eager.builder import thread_local_storage as _builder_tls
 from tvm.target import Target
 
 from tilelang.jit.kernel import JITKernel
@@ -358,6 +359,10 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         Retrieve a TIR (Tensor Intermediate Representation) PrimFunc from the stored callable or object.
         """
         self.initialize_jit_mode(*args, **kwargs)
+
+        _builder_tls.target = self.target
+        logger.warning(f"[TPU]: JITImpl->get_tir(), set target to {self.target}")
+
         if isinstance(self.func, PrimFunc):
             tir = self.func
         elif callable(self.func):
@@ -514,6 +519,9 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
 
         has_tune_params = "__tune_params" in kwargs
         kwargs.update(kwargs.pop("__tune_params", {}))
+
+        _builder_tls.target = self.target
+        logger.warning(f"[TPU]: JITImpl->__call__, set target to {self.target}")
 
         # infer mode early, before parse_args needs it
         if self.mode == "auto":

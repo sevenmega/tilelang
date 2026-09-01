@@ -12,6 +12,9 @@ from tvm.ffi import register_object
 from tilelang import _ffi_api
 from tilelang.jit.exceptions import JITNoBuilderError
 import threading
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
 # especially for issue https://github.com/tile-ai/tilelang/issues/830
@@ -165,6 +168,11 @@ class KernelLaunchFrame(TIRFrame):
         last_block_frame = self.frames[-1]
         assert isinstance(last_block_frame, SBlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
+        if self._is_tpu:
+            # TPU: frames are [serial_bx, serial_by, ..., SBlock]
+            # All frames except the last are tile-iteration loop vars.
+            return _normalize_bindings([frame.vars[0] for frame in self.frames[0:-1]])
+
         # Return a list of grid loop vars (excluding the last 4 frames:
         # threadIdx.x, threadIdx.y, threadIdx.z and the block frame with attributes).
         return _normalize_bindings([frame.vars[0] for frame in self.frames[0:-4]])
@@ -178,6 +186,13 @@ class KernelLaunchFrame(TIRFrame):
         if stack.top() is self:
             stack.pop()
         super().__exit__(ptype, value, trace)
+
+    @property
+    def _is_tpu(self) -> bool:
+        """True if this is a TPU kernel frame (no thread bindings)."""
+        last = self.frames[-1]
+        annotations = getattr(last, 'annotations', None) or {}
+        return bool(annotations.get("is_tpu_kernel_frame", False))
 
     @classmethod
     def Current(cls) -> KernelLaunchFrame | None:
@@ -207,6 +222,8 @@ class KernelLaunchFrame(TIRFrame):
         Returns the thread extent for the given dimension.
         dim=0 corresponds to threadIdx.x, dim=1 to threadIdx.y, and dim=2 to threadIdx.z.
         """
+        if self._is_tpu:
+            return 1
         iter_var = self.frames[-4 + dim].doms[0]
         return int(iter_var.extent)
 
@@ -221,6 +238,8 @@ class KernelLaunchFrame(TIRFrame):
         Returns the thread binding for the given dimension.
         dim=0 corresponds to threadIdx.x, dim=1 to threadIdx.y, and dim=2 to threadIdx.z.
         """
+        if self._is_tpu:
+            raise RuntimeError("TPU kernels have no thread bindings")
         return self.frames[-4 + dim].vars[0]
 
     def get_thread_bindings(self) -> list[Var]:
@@ -228,12 +247,16 @@ class KernelLaunchFrame(TIRFrame):
         Returns the thread binding for the given dimension.
         dim=0 corresponds to threadIdx.x, dim=1 to threadIdx.y, and dim=2 to threadIdx.z.
         """
+        if self._is_tpu:
+            raise RuntimeError("TPU kernels have no thread bindings")
         return [frame.vars[0] for frame in self.frames[-4:-1]]
 
     def get_num_threads(self) -> int:
         """
         Returns the thread indices from the topmost frame.
         """
+        if self._is_tpu:
+            return 1
         num_threads: int = 1
         for thread_dim in range(3):
             num_threads *= self.get_thread_extent(thread_dim)
@@ -264,6 +287,8 @@ class KernelLaunchFrame(TIRFrame):
         """
         Returns the thread indices from the topmost frame.
         """
+        if self._is_tpu:
+            return []
         return [frame.vars[0] for frame in self.frames[-4:-1]]
 
     @property
@@ -326,12 +351,24 @@ def Kernel(
     # so there must be a Builder available. If not, this function
     # is being called outside of a JIT/prim_func context.
     # lazy import to avoid circular import
-    from tilelang.language.eager.builder import Builder
+    from tilelang.language.eager.builder import Builder, thread_local_storage
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
 
     attrs: dict = {}
+
+    target = getattr(thread_local_storage, 'target', None)
+    is_tpu = isinstance(target, str) and target.lower() == "tpu"
+    if is_tpu:
+        logger.warning("[TPU]: Kernel(), target is tpu")
+        attrs["is_tpu_kernel_frame"] = True
+        if prelude is not None:
+            attrs["pragma_import_c"] = prelude
+        return _ffi_api.KernelLaunch(blocks, None, attrs)
+    else:
+        logger.warning("[TPU]: Kernel(), target is NOT tpu")
+
     threads = _normalize_threads(threads)
 
     if prelude is not None:

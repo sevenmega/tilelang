@@ -54,6 +54,32 @@ static ForFrame MakeThreadBindingFrame(const std::string &name,
   return ForFrame(n);
 }
 
+// Build a ForFrame that emits a serial (non-binding) loop -- used for
+// kernel-launch dimensions on non-SIMT targets (TPU) where the kernel
+// itself iterates over tiles
+static ForFrame MakeSerialForFrame(const std::string &name,
+                                   const PrimExpr &extent) {
+  using namespace tvm::tirx;
+  Var var = Var(name, extent->dtype);
+  ObjectPtr<ForFrameNode> n = make_object<ForFrameNode>();
+  n->vars.push_back(var);
+  n->doms.push_back(Range(make_const(extent->dtype, 0), extent));
+  n->f_make_for_loop =
+      [](const Array<Var> &vars, const Array<Range> &doms,
+         const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
+    ICHECK_EQ(vars.size(), 1);
+    ICHECK_EQ(doms.size(), 1);
+    Optional<PrimExpr> step =
+        !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
+    return For(vars[0], doms[0]->min, doms[0]->extent, ForKind::kSerial,
+               body,
+               /*thread_binding=*/std::nullopt,
+               /*annotations=*/Map<String, Any>{},
+               /*step=*/step);
+  };
+  return ForFrame(n);
+}
+
 ForFrame ParallelFor(const Array<PrimExpr> &extents,
                      const Map<String, Any> &annotations) {
   using namespace tvm::tirx;
@@ -265,24 +291,33 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
                                const Optional<Array<PrimExpr>> &block_size_opt,
                                const Map<String, Any> &attrs) {
   ObjectPtr<KernelLaunchFrameNode> n = make_object<KernelLaunchFrameNode>();
-
-  auto block_size = block_size_opt.value_or(Array<PrimExpr>());
   ICHECK(grid_size.size() <= 3);
-  ICHECK(block_size.size() <= 3);
-
   static const char *kBlockVarNames[3] = {"bx", "by", "bz"};
-  static const char *kBlockTags[3] = {"blockIdx.x", "blockIdx.y", "blockIdx.z"};
-  static const char *kThreadVarNames[3] = {"tx", "ty", "tz"};
-  static const char *kThreadTags[3] = {"threadIdx.x", "threadIdx.y",
+
+  if (attrs.defined() && attrs.count(kIsTPUKernelFrame)) {
+    // TPU: serial For loops for tile iteration, no thread frames.
+    // The kernel runs single-threaded and loops over all tiles itself.
+    for (size_t i = 0; i < grid_size.size(); i++) {
+      n->frames.push_back(
+          MakeSerialForFrame(kBlockVarNames[i], grid_size[i]));
+    }
+  } else {
+    auto block_size = block_size_opt.value_or(Array<PrimExpr>());
+    ICHECK(block_size.size() <= 3);
+
+    static const char *kBlockTags[3] = {"blockIdx.x", "blockIdx.y", "blockIdx.z"};
+    static const char *kThreadVarNames[3] = {"tx", "ty", "tz"};
+    static const char *kThreadTags[3] = {"threadIdx.x", "threadIdx.y",
                                        "threadIdx.z"};
 
-  for (size_t i = 0; i < grid_size.size(); i++) {
-    n->frames.push_back(
-        MakeThreadBindingFrame(kBlockVarNames[i], kBlockTags[i], grid_size[i]));
-  }
-  for (size_t i = 0; i < block_size.size(); i++) {
-    n->frames.push_back(MakeThreadBindingFrame(kThreadVarNames[i],
-                                               kThreadTags[i], block_size[i]));
+    for (size_t i = 0; i < grid_size.size(); i++) {
+      n->frames.push_back(
+          MakeThreadBindingFrame(kBlockVarNames[i], kBlockTags[i], grid_size[i]));
+    }
+    for (size_t i = 0; i < block_size.size(); i++) {
+      n->frames.push_back(MakeThreadBindingFrame(kThreadVarNames[i],
+                                                 kThreadTags[i], block_size[i]));
+    }
   }
 
   auto empty_block = tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);

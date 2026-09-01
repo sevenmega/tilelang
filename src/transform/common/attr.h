@@ -29,6 +29,9 @@ namespace attr {
 constexpr const char *kHasTriggerLaunch = "has_cuda_pdl_trigger";
 constexpr const char *kHasGridSync = "has_cuda_pdl_sync";
 
+// Attributes for TPU
+constexpr const char *kIsTPUKernelFrame = "is_tpu_kernel_frame";
+
 // TileLang-only AttrStmt keys.
 constexpr const char *volatile_scope = "volatile_scope";
 constexpr const char *coproc_scope = "coproc_scope";

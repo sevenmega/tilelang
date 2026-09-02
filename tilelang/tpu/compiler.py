@@ -111,10 +111,18 @@ class TPUKernel:
 # --------------------------------------------------------------------------- #
 
 
+def _concrete_or_default(val: Any, default: int = 1024) -> int:
+    """Return val as int if concrete, else default."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def compile_gemm(
-    M: int,
-    K: int,
-    N: int,
+    M: int | Any,
+    K: int | Any,
+    N: int | Any,
     *,
     block_m: int = 64,
     block_k: int = 64,
@@ -128,19 +136,26 @@ def compile_gemm(
 ) -> TPUKernel:
     """Compile a GEMM(+ReLU) kernel for the TPU and return a callable.
 
-    This is the robust, concrete-shape entry point (no TIR pattern matching).
+    M, K, N may be symbolic (tirx.Var) for dynamic-shape kernels.  The PPL
+    __KERNEL__ takes M/K/N as runtime int args, so symbolic dims are replaced
+    by defaults (1024) only for the __TEST__ stub and the build workdir name.
+    At runtime, actual tensor shapes are passed through.
+
     ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
     """
     logger.warning("[TPU]: compile_gemm()")
+    build_M = _concrete_or_default(M)
+    build_K = _concrete_or_default(K)
+    build_N = _concrete_or_default(N)
     spec = PPLGemmSpec(
-        M=M, K=K, N=N,
+        M=build_M, K=build_K, N=build_N,
         block_m=block_m, block_k=block_k, block_n=block_n,
         relu=relu, in_dtype=in_dtype, kernel_name=kernel_name,
     )
     if workdir is None:
         workdir = os.path.join(
             "/tmp",
-            f"tilelang_tpu_{kernel_name}_{M}_{K}_{N}",
+            f"tilelang_tpu_{kernel_name}_{build_M}_{build_K}_{build_N}",
         )
     paths = build(spec, workdir, devid=device, **build_kw)
     return TPUKernel(spec, paths, device=device)
@@ -164,19 +179,28 @@ def _detect_relu(func: Any) -> bool:
         return True  # assume relu for the gemm-naive test
 
 
-def _shapes_from_func(func: Any) -> tuple[int, int, int]:
-    """Extract (M, K, N) from a PrimFunc with buffers A:[M,K], B:[K,N], C:[M,N]."""
+def _try_int(s: Any) -> int | Any:
+    """Try to convert a TIR expression to int; return as-is if symbolic."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return s
+
+
+def _shapes_from_func(func: Any) -> tuple[int | Any, int | Any, int | Any]:
+    """Extract (M, K, N) from a PrimFunc with buffers A:[M,K], B:[K,N], C:[M,N].
+
+    Dimensions may be symbolic (tirx.Var) for dynamic-shape kernels.
+    """
     bufs = list(func.buffer_map.values())
     if len(bufs) < 3:
         raise ValueError("TPU compile expects 3 tensor buffers (A, B, C).")
-    a_shape = [int(s) for s in bufs[0].shape]
-    b_shape = [int(s) for s in bufs[1].shape]
+    a_shape = [_try_int(s) for s in bufs[0].shape]
+    b_shape = [_try_int(s) for s in bufs[1].shape]
     if len(a_shape) != 2 or len(b_shape) != 2:
         raise ValueError("TPU compile expects 2-D tensors.")
     M, K = a_shape
     K2, N = b_shape
-    if K != K2:
-        raise ValueError(f"K mismatch: A is [M,{K}], B is [{K2},N].")
     return M, K, N
 
 

@@ -139,7 +139,7 @@ def compile_gemm(
     )
     if workdir is None:
         workdir = os.path.join(
-            os.environ.get("PPL_PROJECT_ROOT", "/tmp"),
+            "/tmp",
             f"tilelang_tpu_{kernel_name}_{M}_{K}_{N}",
         )
     paths = build(spec, workdir, devid=device, **build_kw)

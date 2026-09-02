@@ -24,16 +24,151 @@ Only the fp16 -> fp32-accum -> (relu) -> fp16 path is verified end-to-end today.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# PPL root resolution                                                          #
+# --------------------------------------------------------------------------- #
+
+def _get_ppl_root() -> str:
+    """Return the path to the PPL release package via $PPL_PROJECT_ROOT.
+
+    The user must source the PPL ``envsetup.sh`` (or set ``PPL_PROJECT_ROOT``
+    manually) before using the TPU backend.
+    """
+    root = os.environ.get("PPL_PROJECT_ROOT", "")
+    if root and os.path.isdir(root):
+        return root
+    raise RuntimeError(
+        "PPL_PROJECT_ROOT is not set or does not point to a valid directory. "
+        "Source the PPL envsetup.sh first "
+        "(e.g. `source /path/to/ppl_v1.7.198-.../envsetup.sh`)."
+    )
+
+
+_CHIP_MAP_CACHE: dict[str, str] | None = None
+
+
+def _resolve_chip_arch(ppl_root: str, chip: str) -> str:
+    """Map user-facing chip name (e.g. 'sg2260e') to arch code ('tpub_7_1_e')."""
+    global _CHIP_MAP_CACHE
+    if _CHIP_MAP_CACHE is None:
+        map_file = os.path.join(ppl_root, "deps", "chip", "chip_map.json")
+        with open(map_file) as f:
+            _CHIP_MAP_CACHE = json.load(f)
+    if chip in _CHIP_MAP_CACHE:
+        return _CHIP_MAP_CACHE[chip]
+    if chip in _CHIP_MAP_CACHE.values():
+        return chip
+    raise ValueError(f"Unknown chip '{chip}'; known: {list(_CHIP_MAP_CACHE.keys())}")
+
+
+def _setup_ppl_env(
+    ppl_root: str,
+    chip: str,
+    chip_arch: str,
+    workdir: str,
+    devid: int,
+    kernel_name: str,
+    mode: str = "pcie",
+) -> None:
+    """Set env vars that ppl-compile and the CMake build expect."""
+    deps = os.path.join(ppl_root, "deps")
+    os.environ["PPL_PROJECT_ROOT"] = ppl_root
+    os.environ["PPL_RUNTIME_PATH"] = deps
+    os.environ["PPL_THIRD_PARTY_PATH"] = os.path.join(ppl_root, "third_party")
+    os.environ["CROSS_TOOLCHAINS"] = os.path.join(ppl_root, "third_party", "toolchains_dir")
+    os.environ["CHIP"] = chip
+    os.environ["CHIP_ARCH"] = chip_arch
+    os.environ["PPL_DEVID"] = str(devid)
+    os.environ["PPL_TPUKERNEL_DEV_MODE"] = mode
+    os.environ["PPL_CACHE_PATH"] = os.path.join(workdir, "cache")
+    os.environ["PPL_FILE_NAME"] = kernel_name
+    os.environ["PPL_DATA_PATH"] = os.path.join(workdir, "data")
+    os.environ["PPL_SRC_DIR_PATH"] = workdir
+
+    chip_lib = os.path.join(deps, "chip", chip_arch, "lib")
+    rt_lib = os.path.join(deps, "runtime", "tpuv7-runtime", "lib")
+    ld = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [os.path.join(workdir, "lib"), chip_lib, rt_lib]
+    for p in parts:
+        if p not in ld:
+            ld = p + ":" + ld if ld else p
+    os.environ["LD_LIBRARY_PATH"] = ld
+
+    if mode == "pcie":
+        os.environ["PPL_KERNEL_PATH"] = os.path.join(workdir, "lib", "libkernel.so")
+        tpuv7_lib = "/opt/tpuv7/tpuv7-current/lib"
+        if tpuv7_lib not in os.environ["LD_LIBRARY_PATH"]:
+            os.environ["LD_LIBRARY_PATH"] += ":" + tpuv7_lib
+
+
+def _run_ppl_compile(
+    ppl_root: str,
+    pl_path: str,
+    chip_arch: str,
+    workdir: str,
+    opt: str = "O3",
+    rv: bool = True,
+    verbose: bool = False,
+) -> None:
+    """Run the ppl-compile MLIR binary to generate device/host code."""
+    compiler = os.path.join(ppl_root, "bin", "ppl-compile")
+    cmd = [
+        compiler,
+        pl_path,
+        "--print-debug-info",
+        "--print-ir",
+        "--chip", chip_arch,
+        f"--{opt}",
+        "--g",
+        "--o", workdir,
+        "--gen-test",
+    ]
+    if rv:
+        cmd.append("--rv")
+    if verbose:
+        print("[ppl_runner] ppl-compile:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def _cmake_build(
+    ppl_root: str,
+    chip_arch: str,
+    workdir: str,
+    mode: str = "pcie",
+    verbose: bool = False,
+) -> None:
+    """Copy pcie.cmake as CMakeLists.txt and run cmake + make."""
+    cmake_template = os.path.join(ppl_root, "deps", "scripts", f"{mode}.cmake")
+    shutil.copy(cmake_template, os.path.join(workdir, "CMakeLists.txt"))
+
+    build_dir = os.path.join(workdir, "build")
+    os.makedirs(build_dir, exist_ok=True)
+
+    cmake_cmd = (
+        f"cmake .. -DDEBUG=False -DCHIP={chip_arch} -DDEV_MODE={mode}"
+        f" -DEXTRA_IDIRS= -DEXTRA_LDIRS= -DEXTRA_CFLAGS= -DEXTRA_LDFLAGS= -DUSE_MPI=False"
+    )
+    make_cmd = "make install"
+    if verbose:
+        make_cmd = "make install VERBOSE=1"
+    for cmd in (cmake_cmd, make_cmd):
+        if verbose:
+            print(f"[ppl_runner] {cmd}")
+        subprocess.run(cmd, shell=True, check=True, cwd=build_dir)
 
 # --------------------------------------------------------------------------- #
 # PPL kernel source template                                                   #
@@ -215,21 +350,6 @@ class PPLGemmSpec:
 # --------------------------------------------------------------------------- #
 
 
-def _ppl_compile_py() -> str:
-    root = os.environ.get("PPL_PROJECT_ROOT")
-    if not root:
-        raise RuntimeError(
-            "PPL_PROJECT_ROOT is not set. Source the PPL envsetup.sh first "
-            "(e.g. `source <ppl>/envsetup.sh`)."
-        )
-    p = os.path.join(root, "python", "tool", "ppl_compile.py")
-    if not os.path.isfile(p):
-        p = shutil.which("ppl_compile.py") or ""
-    if not p:
-        raise RuntimeError("ppl_compile.py not found.")
-    return p
-
-
 def emit_pl(spec: PPLGemmSpec) -> str:
     return _PL_TEMPLATE.format(
         kernel_name=spec.kernel_name,
@@ -244,29 +364,32 @@ def emit_pl(spec: PPLGemmSpec) -> str:
     )
 
 
-def build(
-    spec: PPLGemmSpec,
+def _find_ppl_compile_py(ppl_root: str) -> str | None:
+    """Locate the ``ppl_compile.py`` script inside the PPL tree (fallback path)."""
+    p = os.path.join(ppl_root, "python", "tool", "ppl_compile.py")
+    if os.path.isfile(p):
+        return p
+    return shutil.which("ppl_compile.py")
+
+
+def _build_via_ppl_compile_py(
+    ppl_root: str,
+    pl_path: str,
     workdir: str,
-    *,
-    chip: str = "sg2260e",
-    devid: int = 3,
-    opt: str = "O3",
-    verbose: bool = False,
-) -> dict[str, str]:
-    """Emit .pl, run ppl_compile.py --gen_test, then build the ctypes wrapper .so.
-
-    Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
-    """
-    logger.warning("[TPU]: ppl_runner->build()")
-    os.makedirs(workdir, exist_ok=True)
-    pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
-    with open(pl_path, "w") as f:
-        f.write(emit_pl(spec))
-    logger.warning(f"[TPU]: ppl_runner->build(), emit_pl() into {pl_path}")
-
-    # 1) ppl_compile.py --gen_test  ->  workdir/{lib/libkernel.so, host, include, CMakeLists.txt, ...}
+    chip: str,
+    devid: int,
+    opt: str,
+    verbose: bool,
+) -> None:
+    """Fallback: shell out to ``ppl_compile.py`` as a subprocess (original path)."""
+    script = _find_ppl_compile_py(ppl_root)
+    if not script:
+        raise RuntimeError(
+            "ppl_compile.py not found in the PPL tree and ppl-compile binary "
+            "is also missing.  Check your PPL_PROJECT_ROOT."
+        )
     cmd = [
-        "python3", _ppl_compile_py(),
+        "python3", script,
         "--src", pl_path,
         "--chip", chip,
         "--mode", "pcie",
@@ -277,14 +400,53 @@ def build(
         "--out", workdir,
     ]
     if verbose:
-        print("[ppl_runner] compile:", " ".join(cmd))
+        print("[ppl_runner] fallback ppl_compile.py:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=workdir)
+
+
+def build(
+    spec: PPLGemmSpec,
+    workdir: str,
+    *,
+    chip: str = "sg2260e",
+    devid: int = 3,
+    opt: str = "O3",
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Emit .pl, compile device code, cmake-build libkernel.so, then build the ctypes wrapper .so.
+
+    Uses the inline path (calling ``ppl-compile`` binary + cmake directly) when
+    the ``ppl-compile`` binary is found.  Falls back to shelling out to
+    ``ppl_compile.py`` as a subprocess otherwise.
+
+    Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
+    """
+    logger.warning("[TPU]: ppl_runner->build()")
+    ppl_root = _get_ppl_root()
+    chip_arch = _resolve_chip_arch(ppl_root, chip)
+
+    os.makedirs(workdir, exist_ok=True)
+    pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
+    with open(pl_path, "w") as f:
+        f.write(emit_pl(spec))
+    logger.warning(f"[TPU]: ppl_runner->build(), emit_pl() into {pl_path}")
+
+    compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
+    if os.path.isfile(compiler_bin):
+        # Primary path: inline orchestration (no ppl_compile.py dependency)
+        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+        _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True, verbose=verbose)
+        _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
+    else:
+        # Fallback: delegate to ppl_compile.py subprocess
+        logger.warning("[TPU]: ppl-compile binary not found, falling back to ppl_compile.py subprocess")
+        _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, devid, opt, verbose)
 
     kernel_so = os.path.join(workdir, "lib", "libkernel.so")
     if not os.path.isfile(kernel_so):
         raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
 
-    # 2) Append the ctypes wrapper target and build just that target.
+    # Append the ctypes wrapper target and build just that target.
     wrapper_src = f"{spec.kernel_name}_py_wrapper.cpp"
     wrapper_path = os.path.join(workdir, wrapper_src)
     with open(wrapper_path, "w") as f:
@@ -294,13 +456,6 @@ def build(
     with open(cmake_path, "a") as f:
         f.write(_wrapper_cmake_fragment(spec.kernel_name, wrapper_src))
 
-    # Reuse the build tree ppl_compile.py created (workdir/build).  The appended
-    # wrapper target is only picked up after a (re)configure: the Makefile
-    # generator's auto-reconfigure-on-build is unreliable when the tree was
-    # already configured by ppl_compile.py, so we reconfigure explicitly.
-    # NB: pass NO -D flags here -- ppl_compile.py already baked the real chip
-    # (e.g. tpub_7_1_e) and DEV_MODE into the cache; re-specifying -DCHIP would
-    # override it and break the include paths.
     build_dir = os.path.join(workdir, "build")
     if not os.path.isdir(build_dir):
         os.makedirs(build_dir, exist_ok=True)
@@ -314,7 +469,6 @@ def build(
     )
     wrapper_so = os.path.join(workdir, "lib", f"{spec.kernel_name}_py.so")
     if not os.path.isfile(wrapper_so):
-        # fall back to the build tree install location
         cand = os.path.join(build_dir, f"{spec.kernel_name}_py.so")
         if os.path.isfile(cand):
             wrapper_so = cand
@@ -338,17 +492,7 @@ _TPUV7_LIB = _TPUV7_CURRENT + "/lib"
 
 
 def _ensure_tpu_env(kernel_name: str) -> None:
-    """Populate the env vars the real SG2260E driver + npz_save require.
-
-    Idempotent: only sets a var if the caller hasn't already.  Prepends the
-    lib dirs the validated pcie recipe needs, in order:
-      1. /opt/tpuv7/.../lib         -- the REAL driver (321KB) libtpuv7_rt.so;
-                                       must come first so the deps/ emulator
-                                       copy is not shadowed (it makes
-                                       tpuRtInit exit 255 silently).
-      2. deps/chip/tpub_7_1_e/lib    -- chip runtime (libcdm_* etc.)
-      3. deps/runtime/tpuv7-runtime/lib -- device daemon / cmodel helpers
-    """
+    """Populate the env vars the real SG2260E driver + npz_save require."""
     def _set(k: str, v: str) -> None:
         if not os.environ.get(k):
             os.environ[k] = v
@@ -359,10 +503,9 @@ def _ensure_tpu_env(kernel_name: str) -> None:
     _set("PPL_TPUKERNEL_DEV_MODE", "pcie")
     _set("PPL_FILE_NAME", kernel_name)
 
-    # Build the ordered list of lib dirs to prepend (those not already present).
-    ppl_root = os.environ.get("PPL_PROJECT_ROOT", "")
-    chip_lib = os.path.join(ppl_root, "deps", "chip", "tpub_7_1_e", "lib") if ppl_root else ""
-    rt_lib = os.path.join(ppl_root, "deps", "runtime", "tpuv7-runtime", "lib") if ppl_root else ""
+    ppl_root = _get_ppl_root()
+    chip_lib = os.path.join(ppl_root, "deps", "chip", "tpub_7_1_e", "lib")
+    rt_lib = os.path.join(ppl_root, "deps", "runtime", "tpuv7-runtime", "lib")
     ld_existing = os.environ.get("LD_LIBRARY_PATH", "")
     present = set(ld_existing.split(os.pathsep)) if ld_existing else set()
     to_prepend = [d for d in (_TPUV7_LIB, chip_lib, rt_lib) if d and d not in present]

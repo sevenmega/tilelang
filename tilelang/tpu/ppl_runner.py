@@ -478,12 +478,12 @@ def build(
         ["cmake", "--build", build_dir, "--target", f"{spec.kernel_name}_py", "-j"],
         check=True, cwd=workdir,
     )
+    subprocess.run(
+        ["cmake", "--build", build_dir, "--target", "install"],
+        check=True, cwd=workdir,
+    )
     if not os.path.isfile(wrapper_so):
-        cand = os.path.join(build_dir, f"{spec.kernel_name}_py.so")
-        if os.path.isfile(cand):
-            wrapper_so = cand
-        else:
-            raise RuntimeError(f"wrapper .so not found at {wrapper_so}")
+        raise RuntimeError(f"wrapper .so not found at {wrapper_so}")
     logger.warning(f"[TPU]: ppl_runner->build() done, kernel_so = {kernel_so}, wrapper_so = {wrapper_so}")
     return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
 
@@ -526,16 +526,15 @@ def _ensure_tpu_env(kernel_name: str) -> None:
 
 
 def _preload_real_driver() -> None:
-    """Preload the REAL tpuv7 driver libs (RTLD_GLOBAL) before the wrapper .so.
+    """Preload shared libs (RTLD_GLOBAL) before the wrapper .so.
 
-    The wrapper's DT_RPATH points its ``libtpuv7_rt.so`` dependency at the
-    *emulator* copy under ``deps/runtime/tpuv7-runtime/lib`` (which in turn
-    needs ``libcdm_daemon_emulator.so`` and makes tpuRtInit exit 255).  Both
-    the real and emulator copies share SONAME ``libtpuv7_rt.so``, so dlopen'ing
-    the real one (321KB, from /opt/tpuv7/.../lib) with RTLD_GLOBAL *first* makes
-    the linker reuse it for the wrapper's NEEDED entry -- the emulator (and its
-    libcdm_daemon_emulator.so) is never loaded.  Setting LD_LIBRARY_PATH at
-    runtime would be too late: ld.so only reads it at process startup.
+    dlopen only reads LD_LIBRARY_PATH at process startup, so runtime changes
+    via os.environ are too late.  We explicitly preload every .so the wrapper
+    links against:
+
+    * libtpuv7_rt.so / libtpuv7_modelrt.so from /opt/tpuv7/.../lib — the REAL
+      driver, not the emulator copy under deps/runtime/.
+    * libtpudnn.so from the PPL chip lib dir — TPU DNN ops used by the wrapper.
     """
     for name in ("libtpuv7_rt.so", "libtpuv7_modelrt.so"):
         path = os.path.join(_TPUV7_LIB, name)
@@ -543,7 +542,20 @@ def _preload_real_driver() -> None:
             try:
                 ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
             except OSError:
-                pass  # best-effort; the wrapper load will surface real errors
+                pass
+
+    try:
+        ppl_root = _get_ppl_root()
+        chip_lib = os.path.join(ppl_root, "deps", "chip", "tpub_7_1_e", "lib")
+        for name in ("libtpudnn.so",):
+            path = os.path.join(chip_lib, name)
+            if os.path.isfile(path):
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+    except RuntimeError:
+        pass
 
 
 class PPLKernel:

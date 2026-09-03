@@ -7,7 +7,7 @@ This directory implements the TPU (SG2260E) backend for tilelang, using the PPL 
 - Python 3.10+
 - PyTorch (CPU is sufficient for codegen; TPU runtime needs host tensors)
 - PPL release package v1.7.198+ (e.g. `ppl_v1.7.198-gcf5b037f-20260722/`)
-- Sophgo TPU device (devid 3 by default)
+- Sophgo TPU device (device 0 by default; override with `$TPU_VISIBLE_DEVICES`)
 
 ## Environment Setup
 
@@ -84,7 +84,7 @@ from tilelang.tpu import compile_gemm
 kernel = compile_gemm(
     M=1024, K=1024, N=1024,
     block_m=64, block_k=32, block_n=64,
-    relu=True, in_dtype="fp16", device=3,
+    relu=True, in_dtype="fp16",
 )
 print(kernel.get_kernel_source())
 
@@ -169,10 +169,11 @@ detailed timeline view of TIU and DMA operations.  Alternatively, install the
 ### Python API
 
 ```python
-kernel = matmul_naive.compile(M=1024, N=1024, K=1024)
+from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
 
-# Run profiling
-result = kernel.profile(book_keeping=1, verbose=False)
+spec = PPLGemmSpec(M=1024, K=1024, N=1024, block_m=64, block_k=32, block_n=64)
+workdir = "/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_profile"
+result = run_profiling(spec, workdir)
 print(result["overall_us"])       # Overall kernel time in microseconds
 print(result["profiling_dir"])    # Path to profiling artifacts
 print(result["pftrace_path"])     # Path to .pftrace file
@@ -182,8 +183,9 @@ print(result["pftrace_path"])     # Path to .pftrace file
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
+| `TPU_VISIBLE_DEVICES` | integer | 0 | TPU device ID (like `CUDA_VISIBLE_DEVICES`). All TPU functions read this as the default device. |
 | `PROFILE_BOOK_KEEPING` | 0, 1, 2 | 1 | Profiling detail level passed to `tpudnnEnableProfile()`. Higher values capture more detail at the cost of overhead. |
-| `BMLIB_ENABLE_ALL_PROFILE` | 0, 1 | 0 | Set to 1 to enable hardware profiling. Automatically set by `kernel.profile()`. |
+| `BMLIB_ENABLE_ALL_PROFILE` | 0, 1 | 0 | Set to 1 to enable hardware profiling. Automatically set by `run_profiling()`. |
 
 ### Caching
 
@@ -201,7 +203,7 @@ binary is always re-run to collect fresh profiling data.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `device`  | 3       | TPU device ID for `tpuRtKernelLaunch` |
+| `device`  | 0 (or `$TPU_VISIBLE_DEVICES`) | TPU device ID for `tpuRtKernelLaunch` |
 | `chip`    | sg2260e | Target chip (maps to `tpub_7_1_e`) |
 | `in_dtype`| fp16    | Input dtype: `fp16` or `bf16` |
 | `block_m` | 64      | M-dimension tile size |

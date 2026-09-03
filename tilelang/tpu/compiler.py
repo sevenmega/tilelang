@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 import torch
 
-from tilelang.tpu.ppl_runner import PPLKernel, PPLGemmSpec, build, emit_pl
+from tilelang.tpu.ppl_runner import PPLKernel, PPLGemmSpec, build, emit_pl, get_tpu_device
 import logging
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class TPUKernel:
     Callable as ``c = kernel(a, b)`` with fp16 CPU torch tensors.
     """
 
-    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int = 3):
+    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int = 0):
         self.spec = spec
         self.paths = paths
         self.device = device
@@ -137,7 +137,7 @@ def compile_gemm(
     block_n: int = 64,
     relu: bool = True,
     in_dtype: str = "fp16",
-    device: int = 3,
+    device: int | None = None,
     workdir: str | None = None,
     kernel_name: str = "tl_gemm_relu",
     **build_kw: Any,
@@ -151,6 +151,8 @@ def compile_gemm(
 
     ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
     """
+    if device is None:
+        device = get_tpu_device()
     logger.warning("[TPU]: compile_gemm()")
     build_M = _concrete_or_default(M)
     build_K = _concrete_or_default(K)
@@ -285,7 +287,7 @@ def compile(
     *,
     out_idx: int | list[int] = -1,
     target: str = "tpu",
-    device: int = 3,
+    device: int | None = None,
     workdir: str | None = None,
     block_m: int | None = None,
     block_k: int | None = None,
@@ -305,6 +307,8 @@ def compile(
 
     Tile sizes / dtype passed explicitly override the IR-derived values.
     """
+    if device is None:
+        device = get_tpu_device()
     logger.warning("[TPU]: tpu_compiler()")
     if target != "tpu":
         raise ValueError(f"tilelang.tpu.compile only supports target='tpu', got {target!r}.")

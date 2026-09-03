@@ -42,6 +42,15 @@ logger = logging.getLogger(__name__)
 # PPL root resolution                                                          #
 # --------------------------------------------------------------------------- #
 
+def get_tpu_device() -> int:
+    """Return the TPU device ID from ``$TPU_VISIBLE_DEVICES`` (default 0)."""
+    val = os.environ.get("TPU_VISIBLE_DEVICES", "0")
+    try:
+        return int(val.split(",")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
 def _get_ppl_root() -> str:
     """Return the path to the PPL release package via $PPL_PROJECT_ROOT.
 
@@ -414,7 +423,7 @@ def build(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int = 3,
+    devid: int | None = None,
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
@@ -426,6 +435,8 @@ def build(
 
     Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
     """
+    if devid is None:
+        devid = get_tpu_device()
     logger.warning("[TPU]: ppl_runner->build()")
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
@@ -503,7 +514,7 @@ def build_for_profile(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int = 3,
+    devid: int | None = None,
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
@@ -511,6 +522,8 @@ def build_for_profile(
 
     Returns a dict with paths: {"pl", "kernel_so", "test_case", "workdir"}.
     """
+    if devid is None:
+        devid = get_tpu_device()
     logger.warning("[TPU]: ppl_runner->build_for_profile()")
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
@@ -574,7 +587,7 @@ def run_profiling(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int = 3,
+    devid: int | None = None,
     book_keeping: int = 1,
     verbose: bool = False,
 ) -> dict[str, Any]:
@@ -585,6 +598,8 @@ def run_profiling(
     import glob as _glob
     import sys as _sys
 
+    if devid is None:
+        devid = get_tpu_device()
     paths = build_for_profile(spec, workdir, chip=chip, devid=devid, verbose=verbose)
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
@@ -721,7 +736,7 @@ def _preload_real_driver() -> None:
 class PPLKernel:
     """ctypes handle to a built PPL GEMM(+ReLU) kernel on TPU."""
 
-    def __init__(self, paths: dict[str, str], *, device: int = 3, kernel_name: str = "tl_gemm_relu"):
+    def __init__(self, paths: dict[str, str], *, device: int = 0, kernel_name: str = "tl_gemm_relu"):
         logger.warning("[TPU]: PPLKernel->__init__")
         self.paths = paths
         self.device = device

@@ -61,10 +61,13 @@ if __name__ == "__main__":
     import sys
     if "--run" in sys.argv:
         import torch
+        do_profile = "--profile" in sys.argv
+        if do_profile:
+            from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
 
         test_shapes = [
             (1024, 1024, 1024),
-            (1024, 2048, 1024),
+            (1024, 512, 1024),
         ]
 
         for M_val, N_val, K_val in test_shapes:
@@ -80,10 +83,10 @@ if __name__ == "__main__":
                 print(f"FAIL: max diff = {max_diff} (M={M_val}, N={N_val}, K={K_val})")
                 sys.exit(1)
 
-        print("\nAll dynamic shape tests passed.")
+            if do_profile:
+                print(f"\n--- Profiling M={M_val}, N={N_val}, K={K_val} ---")
+                spec = PPLGemmSpec(M=M_val, K=K_val, N=N_val, block_m=64, block_k=32, block_n=64)
+                workdir = f"/tmp/tilelang_tpu_tl_gemm_relu_{M_val}_{K_val}_{N_val}_profile"
+                run_profiling(spec, workdir, verbose="--verbose" in sys.argv)
 
-    if "--profile" in sys.argv:
-        from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
-        spec = PPLGemmSpec(M=1024, K=1024, N=1024, block_m=64, block_k=32, block_n=64)
-        workdir = "/tmp/tilelang_tpu_tl_gemm_relu_dyn_dyn_dyn_profile"
-        run_profiling(spec, workdir, verbose="--verbose" in sys.argv)
+        print("\nAll dynamic shape tests passed.")

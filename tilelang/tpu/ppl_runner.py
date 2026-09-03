@@ -111,17 +111,21 @@ def _setup_ppl_env(
     chip_lib = os.path.join(deps, "chip", chip_arch, "lib")
     rt_lib = os.path.join(deps, "runtime", "tpuv7-runtime", "lib")
     ld = os.environ.get("LD_LIBRARY_PATH", "")
-    parts = [os.path.join(workdir, "lib"), chip_lib, rt_lib]
-    for p in parts:
-        if p not in ld:
-            ld = p + ":" + ld if ld else p
+    ld_set = set(ld.split(":")) if ld else set()
+    if mode == "pcie":
+        # Real driver (/opt/tpuv7/) must precede the emulator copies in deps/runtime/
+        tpuv7_lib = "/opt/tpuv7/tpuv7-current/lib"
+        parts = [os.path.join(workdir, "lib"), tpuv7_lib, chip_lib, rt_lib]
+    else:
+        parts = [os.path.join(workdir, "lib"), chip_lib, rt_lib]
+    new = [p for p in parts if p not in ld_set]
+    if new:
+        prefix = ":".join(new)
+        ld = prefix + ":" + ld if ld else prefix
     os.environ["LD_LIBRARY_PATH"] = ld
 
     if mode == "pcie":
         os.environ["PPL_KERNEL_PATH"] = os.path.join(workdir, "lib", "libkernel.so")
-        tpuv7_lib = "/opt/tpuv7/tpuv7-current/lib"
-        if tpuv7_lib not in os.environ["LD_LIBRARY_PATH"]:
-            os.environ["LD_LIBRARY_PATH"] += ":" + tpuv7_lib
 
 
 def _run_ppl_compile(

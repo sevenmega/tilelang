@@ -119,6 +119,14 @@ def _concrete_or_default(val: Any, default: int = 1024) -> int:
         return default
 
 
+def _shape_tag(val: Any) -> str:
+    """Return a workdir-safe tag: the concrete value as a string, or 'dyn'."""
+    try:
+        return str(int(val))
+    except (TypeError, ValueError):
+        return "dyn"
+
+
 def compile_gemm(
     M: int | Any,
     K: int | Any,
@@ -138,8 +146,8 @@ def compile_gemm(
 
     M, K, N may be symbolic (tirx.Var) for dynamic-shape kernels.  The PPL
     __KERNEL__ takes M/K/N as runtime int args, so symbolic dims are replaced
-    by defaults (1024) only for the __TEST__ stub and the build workdir name.
-    At runtime, actual tensor shapes are passed through.
+    by defaults (1024) only for the __TEST__ stub.  At runtime, actual tensor
+    shapes are passed through.
 
     ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
     """
@@ -153,9 +161,10 @@ def compile_gemm(
         relu=relu, in_dtype=in_dtype, kernel_name=kernel_name,
     )
     if workdir is None:
+        tag_m, tag_k, tag_n = _shape_tag(M), _shape_tag(K), _shape_tag(N)
         workdir = os.path.join(
             "/tmp",
-            f"tilelang_tpu_{kernel_name}_{build_M}_{build_K}_{build_N}",
+            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}",
         )
     paths = build(spec, workdir, devid=device, **build_kw)
     return TPUKernel(spec, paths, device=device)

@@ -426,27 +426,38 @@ def build(
     chip_arch = _resolve_chip_arch(ppl_root, chip)
 
     os.makedirs(workdir, exist_ok=True)
+    pl_content = emit_pl(spec)
     pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
+    kernel_so = os.path.join(workdir, "lib", "libkernel.so")
+    wrapper_so = os.path.join(workdir, "lib", f"{spec.kernel_name}_py.so")
+
+    # Cache: skip compilation if artifacts exist and .pl source hasn't changed.
+    cached = False
+    if os.path.isfile(kernel_so) and os.path.isfile(wrapper_so) and os.path.isfile(pl_path):
+        with open(pl_path) as f:
+            if f.read() == pl_content:
+                cached = True
+                logger.warning("[TPU]: ppl_runner->build() cache HIT, skipping compilation")
+
+    if cached:
+        return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
+
     with open(pl_path, "w") as f:
-        f.write(emit_pl(spec))
+        f.write(pl_content)
     logger.warning(f"[TPU]: ppl_runner->build(), emit_pl() into {pl_path}")
 
     compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
     if os.path.isfile(compiler_bin):
-        # Primary path: inline orchestration (no ppl_compile.py dependency)
         _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
         _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True, verbose=verbose)
         _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
     else:
-        # Fallback: delegate to ppl_compile.py subprocess
         logger.warning("[TPU]: ppl-compile binary not found, falling back to ppl_compile.py subprocess")
         _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, devid, opt, verbose)
 
-    kernel_so = os.path.join(workdir, "lib", "libkernel.so")
     if not os.path.isfile(kernel_so):
         raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
 
-    # Append the ctypes wrapper target and build just that target.
     wrapper_src = f"{spec.kernel_name}_py_wrapper.cpp"
     wrapper_path = os.path.join(workdir, wrapper_src)
     with open(wrapper_path, "w") as f:
@@ -467,7 +478,6 @@ def build(
         ["cmake", "--build", build_dir, "--target", f"{spec.kernel_name}_py", "-j"],
         check=True, cwd=workdir,
     )
-    wrapper_so = os.path.join(workdir, "lib", f"{spec.kernel_name}_py.so")
     if not os.path.isfile(wrapper_so):
         cand = os.path.join(build_dir, f"{spec.kernel_name}_py.so")
         if os.path.isfile(cand):

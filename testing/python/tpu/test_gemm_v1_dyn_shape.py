@@ -81,3 +81,9 @@ if __name__ == "__main__":
                 sys.exit(1)
 
         print("\nAll dynamic shape tests passed.")
+
+    if "--profile" in sys.argv:
+        from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
+        spec = PPLGemmSpec(M=1024, K=1024, N=1024, block_m=64, block_k=32, block_n=64)
+        workdir = "/tmp/tilelang_tpu_tl_gemm_relu_dyn_dyn_dyn_profile"
+        run_profiling(spec, workdir, verbose="--verbose" in sys.argv)

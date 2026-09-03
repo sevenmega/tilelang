@@ -122,9 +122,14 @@ def _run_ppl_compile(
     workdir: str,
     opt: str = "O3",
     rv: bool = True,
+    autotune: bool = False,
     verbose: bool = False,
 ) -> None:
-    """Run the ppl-compile MLIR binary to generate device/host code."""
+    """Run the ppl-compile MLIR binary to generate device/host code.
+
+    When *autotune* is True, ``--autotune`` is passed instead of ``--gen-test``
+    so the generated code includes profiling instrumentation.
+    """
     compiler = os.path.join(ppl_root, "bin", "ppl-compile")
     cmd = [
         compiler,
@@ -135,7 +140,7 @@ def _run_ppl_compile(
         f"--{opt}",
         "--g",
         "--o", workdir,
-        "--gen-test",
+        "--autotune" if autotune else "--gen-test",
     ]
     if rv:
         cmd.append("--rv")
@@ -486,6 +491,161 @@ def build(
         raise RuntimeError(f"wrapper .so not found at {wrapper_so}")
     logger.warning(f"[TPU]: ppl_runner->build() done, kernel_so = {kernel_so}, wrapper_so = {wrapper_so}")
     return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
+
+
+# --------------------------------------------------------------------------- #
+# Profiling                                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def build_for_profile(
+    spec: PPLGemmSpec,
+    workdir: str,
+    *,
+    chip: str = "sg2260e",
+    devid: int = 3,
+    opt: str = "O3",
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Build with ``--autotune`` for profiling (no ctypes wrapper needed).
+
+    Returns a dict with paths: {"pl", "kernel_so", "test_case", "workdir"}.
+    """
+    logger.warning("[TPU]: ppl_runner->build_for_profile()")
+    ppl_root = _get_ppl_root()
+    chip_arch = _resolve_chip_arch(ppl_root, chip)
+
+    os.makedirs(workdir, exist_ok=True)
+    pl_content = emit_pl(spec)
+    pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
+    kernel_so = os.path.join(workdir, "lib", "libkernel.so")
+    test_case = os.path.join(workdir, "test_case")
+
+    cached = False
+    if os.path.isfile(kernel_so) and os.path.isfile(test_case) and os.path.isfile(pl_path):
+        with open(pl_path) as f:
+            if f.read() == pl_content:
+                cached = True
+                logger.warning("[TPU]: build_for_profile() cache HIT")
+
+    if cached:
+        return {"pl": pl_path, "kernel_so": kernel_so, "test_case": test_case, "workdir": workdir}
+
+    with open(pl_path, "w") as f:
+        f.write(pl_content)
+
+    compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
+    if not os.path.isfile(compiler_bin):
+        raise RuntimeError(
+            "Profiling requires the ppl-compile binary. "
+            "Ensure $PPL_PROJECT_ROOT/bin/ppl-compile exists."
+        )
+
+    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+    _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
+                     autotune=True, verbose=verbose)
+    _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
+
+    if not os.path.isfile(kernel_so):
+        raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
+    if not os.path.isfile(test_case):
+        raise RuntimeError(f"test_case binary not produced at {test_case}")
+
+    logger.warning(f"[TPU]: build_for_profile() done, test_case = {test_case}")
+    return {"pl": pl_path, "kernel_so": kernel_so, "test_case": test_case, "workdir": workdir}
+
+
+def _parse_summary(summary_path: str) -> float:
+    """Parse bigTpuProfile summary.txt for the Overall time (us)."""
+    if not os.path.isfile(summary_path):
+        return 0.0
+    import ast as _ast
+    with open(summary_path) as f:
+        for line in f:
+            if "Overall" in line:
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    return float(_ast.literal_eval(parts[2]))
+    return 0.0
+
+
+def run_profiling(
+    spec: PPLGemmSpec,
+    workdir: str,
+    *,
+    chip: str = "sg2260e",
+    devid: int = 3,
+    book_keeping: int = 1,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Build with profiling instrumentation, run test_case, collect and display results.
+
+    Returns a dict: {"profiling_dir", "overall_us", "summary_path", "pftrace_path"}.
+    """
+    import glob as _glob
+    import sys as _sys
+
+    paths = build_for_profile(spec, workdir, chip=chip, devid=devid, verbose=verbose)
+    ppl_root = _get_ppl_root()
+    chip_arch = _resolve_chip_arch(ppl_root, chip)
+
+    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+    os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
+    os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
+
+    profiling_dir = os.path.join(workdir, "profiling")
+    os.makedirs(profiling_dir, exist_ok=True)
+
+    test_case = paths["test_case"]
+    logger.warning(f"[TPU]: running test_case for profiling in {profiling_dir}")
+    ret = subprocess.run([test_case, str(devid)], cwd=profiling_dir)
+    if ret.returncode != 0:
+        raise RuntimeError(f"test_case exited with code {ret.returncode}")
+
+    cdm_files = sorted(_glob.glob(os.path.join(profiling_dir, "cdm_profile_data_dev*")))
+    if not cdm_files:
+        raise RuntimeError(f"No cdm_profile_data_dev* files found in {profiling_dir}")
+
+    overall_us = 0.0
+    summary_path = ""
+    pftrace_path = ""
+
+    for i, cdm_file in enumerate(cdm_files):
+        out_dir = os.path.join(profiling_dir, f"out_{i}")
+        cmd = ["bigTpuProfile", cdm_file, out_dir]
+        if verbose:
+            print(f"[ppl_runner] {' '.join(cmd)}")
+        ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if ret.returncode != 0:
+            print(ret.stdout, end="", file=_sys.stderr)
+            print(ret.stderr, end="", file=_sys.stderr)
+            raise RuntimeError(f"bigTpuProfile failed: {' '.join(cmd)}")
+
+        sp = os.path.join(out_dir, "summary.txt")
+        overall_us += _parse_summary(sp)
+        if i == 0:
+            summary_path = sp
+            pf = os.path.join(out_dir, "perfetto.pftrace")
+            if os.path.isfile(pf):
+                pftrace_path = pf
+
+        if os.path.isfile(sp):
+            print(open(sp).read(), file=_sys.stderr)
+
+    print("=" * 60, file=_sys.stderr)
+    print(f"  Overall kernel time: {overall_us:.2f} us", file=_sys.stderr)
+    print(f"  Profiling data:      {profiling_dir}", file=_sys.stderr)
+    if pftrace_path:
+        print(f"  Perfetto trace:      {pftrace_path}", file=_sys.stderr)
+        print("  Open in Perfetto UI: https://ui.perfetto.dev/", file=_sys.stderr)
+    print("=" * 60, file=_sys.stderr)
+
+    return {
+        "profiling_dir": profiling_dir,
+        "overall_us": overall_us,
+        "summary_path": summary_path,
+        "pftrace_path": pftrace_path,
+    }
 
 
 # --------------------------------------------------------------------------- #

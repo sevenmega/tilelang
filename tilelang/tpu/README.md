@@ -122,6 +122,81 @@ Key design: the PPL backend bypasses TVM lowering entirely. It pattern-matches t
 
 Currently: fp16 GEMM with fp32 accumulation, optional ReLU activation, square tiles that divide M/K/N evenly.
 
+## Profiling
+
+The TPU backend supports hardware profiling via PPL's `--autotune` compilation
+mode and `bigTpuProfile`.  Profiling measures TIU/DMA utilization, parallelism,
+bandwidth, and per-operation timing on the actual TPU hardware.
+
+### Quick start
+
+```bash
+source /path/to/ppl_.../envsetup.sh
+python testing/python/tpu/test_gemm_naive.py --profile
+```
+
+This will:
+
+1. Compile the kernel with profiling instrumentation (`ppl-compile --autotune`)
+2. Run the `test_case` binary on the TPU with profiling enabled
+3. Process the profiling data with `bigTpuProfile`
+4. Print a summary table and save detailed data
+
+You can combine `--run` (correctness test) and `--profile` (profiling) in the same invocation.
+
+### Profiling data location
+
+Profiling artifacts are saved under a `_profile` suffixed workdir in `/tmp/`:
+
+```
+/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_profile/
+├── tl_gemm_relu.pl              # PPL kernel source
+├── test_case                    # profiling-instrumented binary
+├── lib/libkernel.so             # device kernel
+└── profiling/                   # profiling run output
+    ├── cdm_profile_data_dev*    # raw hardware profile data
+    └── out_0/
+        ├── summary.txt          # parsed summary (Overall time, etc.)
+        └── perfetto.pftrace     # Perfetto trace file
+```
+
+### Viewing traces in Perfetto
+
+Open the `.pftrace` file in [Perfetto UI](https://ui.perfetto.dev/) for a
+detailed timeline view of TIU and DMA operations.  Alternatively, install the
+**Perfetto Trace IDE** VS Code extension to view traces directly in the editor.
+
+### Python API
+
+```python
+kernel = matmul_naive.compile(M=1024, N=1024, K=1024)
+
+# Run profiling
+result = kernel.profile(book_keeping=1, verbose=False)
+print(result["overall_us"])       # Overall kernel time in microseconds
+print(result["profiling_dir"])    # Path to profiling artifacts
+print(result["pftrace_path"])     # Path to .pftrace file
+```
+
+### Environment variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `PROFILE_BOOK_KEEPING` | 0, 1, 2 | 1 | Profiling detail level passed to `tpudnnEnableProfile()`. Higher values capture more detail at the cost of overhead. |
+| `BMLIB_ENABLE_ALL_PROFILE` | 0, 1 | 0 | Set to 1 to enable hardware profiling. Automatically set by `kernel.profile()`. |
+
+### Caching
+
+The profiling build uses a separate workdir from the normal build (suffixed
+with `_profile`).  The same disk cache logic applies: if the `.pl` source and
+`test_case` binary already exist, compilation is skipped.  The `test_case`
+binary is always re-run to collect fresh profiling data.
+
+### Requirements
+
+- `bigTpuProfile` Python package (`pip install bigTpuProfile`)
+- `ppl-compile` binary (the ppl_compile.py fallback does not support profiling)
+
 ## Configuration
 
 | Parameter | Default | Description |

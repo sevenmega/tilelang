@@ -194,6 +194,7 @@ def compile_gemm(
     block_n: int = 64,
     relu: bool = True,
     in_dtype: str = "fp16",
+    core_num: int = 1,
     workdir: str | None = None,
     kernel_name: str = "tl_gemm_relu",
     **build_kw: Any,
@@ -209,6 +210,7 @@ def compile_gemm(
     ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
 
     ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
+    ``core_num`` is 1 (single-core) or >1 (multi-core, SG2260E has 4).
     """
     logger.warning("[TPU]: compile_gemm()")
     build_M = _concrete_or_default(M)
@@ -217,13 +219,15 @@ def compile_gemm(
     spec = PPLGemmSpec(
         M=build_M, K=build_K, N=build_N,
         block_m=block_m, block_k=block_k, block_n=block_n,
-        relu=relu, in_dtype=in_dtype, kernel_name=kernel_name,
+        relu=relu, in_dtype=in_dtype, core_num=core_num,
+        kernel_name=kernel_name,
     )
     if workdir is None:
         tag_m, tag_k, tag_n = _shape_tag(M), _shape_tag(K), _shape_tag(N)
+        mc_tag = f"_mc{core_num}" if core_num > 1 else ""
         workdir = os.path.join(
             "/tmp",
-            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}",
+            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}",
         )
     paths = build(spec, workdir, **build_kw)
     return TPUKernel(spec, paths)
@@ -339,6 +343,36 @@ def _in_dtype_from_func(func: Any) -> str:
     return _DTYPE_TO_PPL.get(dt, "fp16")
 
 
+def _core_num_from_func(func: Any) -> int:
+    """Detect multi-core from the T.Kernel grid dimensionality.
+
+    A 2-axis ``T.Kernel(bx, by)`` is single-core (returns 1).
+    A 3-axis ``T.Kernel(bx, by, bc)`` produces a ``bz`` For-node with
+    ``kind=4`` (ThreadBinding) whose extent is the core count.
+    """
+    try:
+        from tvm import tirx as _tir
+
+        bz_extent: list[int] = []
+
+        def visit(node: Any) -> Any:
+            if type(node).__name__ != "For":
+                return None
+            if node.kind == 4 and str(node.loop_var) == "bz":
+                try:
+                    bz_extent.append(int(node.extent))
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        _tir.stmt_functor.post_order_visit(func.body, visit)
+        if bz_extent and bz_extent[0] > 1:
+            return bz_extent[0]
+    except Exception:
+        pass
+    return 1
+
+
 def compile(
     func: Any,
     *,
@@ -349,6 +383,7 @@ def compile(
     block_k: int | None = None,
     block_n: int | None = None,
     in_dtype: str | None = None,
+    core_num: int | None = None,
     **build_kw: Any,
 ) -> TPUKernel:
     """Compile a *lowered* tilelang PrimFunc for the TPU (GEMM[+ReLU] codegen).
@@ -364,7 +399,7 @@ def compile(
     Compilation is device-agnostic.  The device ID is resolved at runtime from
     ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
 
-    Tile sizes / dtype passed explicitly override the IR-derived values.
+    Tile sizes / dtype / core_num passed explicitly override the IR-derived values.
     """
     logger.warning("[TPU]: tpu_compiler()")
     if target != "tpu":
@@ -376,6 +411,7 @@ def compile(
     relu = _detect_relu(func)
     ir_in = _in_dtype_from_func(func)
     ir_bm, ir_bk, ir_bn = _tiles_from_func(func, ir_in)
+    ir_core = _core_num_from_func(func)
     return compile_gemm(
         M, K, N,
         block_m=block_m if block_m is not None else ir_bm,
@@ -383,5 +419,6 @@ def compile(
         block_n=block_n if block_n is not None else ir_bn,
         relu=relu, workdir=workdir,
         in_dtype=in_dtype if in_dtype is not None else ir_in,
+        core_num=core_num if core_num is not None else ir_core,
         **build_kw,
     )

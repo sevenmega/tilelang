@@ -65,13 +65,19 @@ class TPUKernel:
     Callable as ``c = kernel(a, b)`` with fp16 CPU torch tensors.
     """
 
-    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int = 0):
+    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int | None = None):
         self.spec = spec
         self.paths = paths
-        self.device = device
+        self._device = device
         self._runtime: PPLKernel | None = None
         self._a: torch.Tensor | None = None
         self._b: torch.Tensor | None = None
+
+    @property
+    def device(self) -> int:
+        if self._device is None:
+            self._device = get_tpu_device()
+        return self._device
 
     def _ensure_runtime(self) -> PPLKernel:
         if self._runtime is None:
@@ -137,7 +143,6 @@ def compile_gemm(
     block_n: int = 64,
     relu: bool = True,
     in_dtype: str = "fp16",
-    device: int | None = None,
     workdir: str | None = None,
     kernel_name: str = "tl_gemm_relu",
     **build_kw: Any,
@@ -149,10 +154,11 @@ def compile_gemm(
     by defaults (1024) only for the __TEST__ stub.  At runtime, actual tensor
     shapes are passed through.
 
+    Compilation is device-agnostic.  The device ID is resolved at runtime from
+    ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
+
     ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
     """
-    if device is None:
-        device = get_tpu_device()
     logger.warning("[TPU]: compile_gemm()")
     build_M = _concrete_or_default(M)
     build_K = _concrete_or_default(K)
@@ -168,8 +174,8 @@ def compile_gemm(
             "/tmp",
             f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}",
         )
-    paths = build(spec, workdir, devid=device, **build_kw)
-    return TPUKernel(spec, paths, device=device)
+    paths = build(spec, workdir, **build_kw)
+    return TPUKernel(spec, paths)
 
 
 def _detect_relu(func: Any) -> bool:
@@ -287,7 +293,6 @@ def compile(
     *,
     out_idx: int | list[int] = -1,
     target: str = "tpu",
-    device: int | None = None,
     workdir: str | None = None,
     block_m: int | None = None,
     block_k: int | None = None,
@@ -305,10 +310,11 @@ def compile(
     emits a PPL ``.pl`` kernel, builds it with the PPL toolchain, and returns a
     callable ``TPUKernel``.
 
+    Compilation is device-agnostic.  The device ID is resolved at runtime from
+    ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
+
     Tile sizes / dtype passed explicitly override the IR-derived values.
     """
-    if device is None:
-        device = get_tpu_device()
     logger.warning("[TPU]: tpu_compiler()")
     if target != "tpu":
         raise ValueError(f"tilelang.tpu.compile only supports target='tpu', got {target!r}.")
@@ -324,7 +330,7 @@ def compile(
         block_m=block_m if block_m is not None else ir_bm,
         block_k=block_k if block_k is not None else ir_bk,
         block_n=block_n if block_n is not None else ir_bn,
-        relu=relu, device=device, workdir=workdir,
+        relu=relu, workdir=workdir,
         in_dtype=in_dtype if in_dtype is not None else ir_in,
         **build_kw,
     )

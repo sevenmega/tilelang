@@ -201,11 +201,18 @@ binary is always re-run to collect fresh profiling data.
 
 ## Configuration
 
+### Compile-time parameters
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `device`  | 0 (or `$TPU_VISIBLE_DEVICES`) | TPU device ID for `tpuRtKernelLaunch` |
 | `chip`    | sg2260e | Target chip (maps to `tpub_7_1_e`) |
 | `in_dtype`| fp16    | Input dtype: `fp16` or `bf16` |
 | `block_m` | 64      | M-dimension tile size |
 | `block_k` | 32      | K-dimension tile size |
 | `block_n` | 64      | N-dimension tile size |
+
+### Runtime parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `device`  | `$TPU_VISIBLE_DEVICES` (default 0) | TPU device ID for `tpuRtKernelLaunch`. Resolved when the kernel is first called, not at compile time. |

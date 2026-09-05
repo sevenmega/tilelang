@@ -89,11 +89,14 @@ def _setup_ppl_env(
     chip: str,
     chip_arch: str,
     workdir: str,
-    devid: int,
     kernel_name: str,
     mode: str = "pcie",
 ) -> None:
-    """Set env vars that ppl-compile and the CMake build expect."""
+    """Set env vars that ppl-compile and the CMake build expect.
+
+    Device ID is intentionally absent — compilation is device-agnostic.
+    ``PPL_DEVID`` is set at runtime by ``_ensure_tpu_env()`` / ``run_profiling()``.
+    """
     deps = os.path.join(ppl_root, "deps")
     os.environ["PPL_PROJECT_ROOT"] = ppl_root
     os.environ["PPL_RUNTIME_PATH"] = deps
@@ -101,7 +104,6 @@ def _setup_ppl_env(
     os.environ["CROSS_TOOLCHAINS"] = os.path.join(ppl_root, "third_party", "toolchains_dir")
     os.environ["CHIP"] = chip
     os.environ["CHIP_ARCH"] = chip_arch
-    os.environ["PPL_DEVID"] = str(devid)
     os.environ["PPL_TPUKERNEL_DEV_MODE"] = mode
     os.environ["PPL_CACHE_PATH"] = os.path.join(workdir, "cache")
     os.environ["PPL_FILE_NAME"] = kernel_name
@@ -395,11 +397,14 @@ def _build_via_ppl_compile_py(
     pl_path: str,
     workdir: str,
     chip: str,
-    devid: int,
     opt: str,
     verbose: bool,
 ) -> None:
-    """Fallback: shell out to ``ppl_compile.py`` as a subprocess (original path)."""
+    """Fallback: shell out to ``ppl_compile.py`` as a subprocess (original path).
+
+    ``--devid`` is intentionally omitted — it only affects test execution inside
+    ``ppl_compile.py``, not code generation, and we never run the test from here.
+    """
     script = _find_ppl_compile_py(ppl_root)
     if not script:
         raise RuntimeError(
@@ -413,7 +418,6 @@ def _build_via_ppl_compile_py(
         "--mode", "pcie",
         "--rv",
         "--opt", opt,
-        "--devid", str(devid),
         "--gen_test",
         "--out", workdir,
     ]
@@ -427,7 +431,6 @@ def build(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int | None = None,
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
@@ -437,10 +440,10 @@ def build(
     the ``ppl-compile`` binary is found.  Falls back to shelling out to
     ``ppl_compile.py`` as a subprocess otherwise.
 
+    Compilation is device-agnostic — no device ID is needed here.
+
     Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
     """
-    if devid is None:
-        devid = get_tpu_device()
     logger.warning("[TPU]: ppl_runner->build()")
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
@@ -468,12 +471,12 @@ def build(
 
     compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
     if os.path.isfile(compiler_bin):
-        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
         _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True, verbose=verbose)
         _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
     else:
         logger.warning("[TPU]: ppl-compile binary not found, falling back to ppl_compile.py subprocess")
-        _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, devid, opt, verbose)
+        _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, opt, verbose)
 
     if not os.path.isfile(kernel_so):
         raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
@@ -518,16 +521,15 @@ def build_for_profile(
     workdir: str,
     *,
     chip: str = "sg2260e",
-    devid: int | None = None,
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
     """Build with ``--autotune`` for profiling (no ctypes wrapper needed).
 
+    Compilation is device-agnostic — no device ID is needed here.
+
     Returns a dict with paths: {"pl", "kernel_so", "test_case", "workdir"}.
     """
-    if devid is None:
-        devid = get_tpu_device()
     logger.warning("[TPU]: ppl_runner->build_for_profile()")
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
@@ -558,7 +560,7 @@ def build_for_profile(
             "Ensure $PPL_PROJECT_ROOT/bin/ppl-compile exists."
         )
 
-    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
     _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
                      autotune=True, verbose=verbose)
     _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
@@ -604,11 +606,12 @@ def run_profiling(
 
     if devid is None:
         devid = get_tpu_device()
-    paths = build_for_profile(spec, workdir, chip=chip, devid=devid, verbose=verbose)
+    paths = build_for_profile(spec, workdir, chip=chip, verbose=verbose)
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
 
-    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, devid, spec.kernel_name)
+    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
+    os.environ["PPL_DEVID"] = str(devid)
     os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
     os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
 

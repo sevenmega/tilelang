@@ -318,6 +318,14 @@ int py_{kernel_name}(void *h, unsigned long long res, unsigned long long left,
   return {kernel_name}((tpudnnHandle_t)h, res, left, right, M, K, N);
 }}
 
+int py_enable_profile(void *h, int max_record_num, int mode) {{
+  return (int)tpudnnEnableProfile((tpudnnHandle_t)h, max_record_num, mode);
+}}
+
+int py_disable_profile(void *h) {{
+  return (int)tpudnnDisableProfile((tpudnnHandle_t)h);
+}}
+
 }}  // extern "C"
 """
 
@@ -434,15 +442,22 @@ def build(
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
-    """Emit .pl, compile device code, cmake-build libkernel.so, then build the ctypes wrapper .so.
+    """Emit .pl, compile device code, cmake-build libkernel.so + ctypes wrapper + test_case.
+
+    Always compiles with ``--autotune`` so the ``test_case`` binary includes
+    profiling instrumentation.  Profiling data can be collected later via
+    ``run_profiling()`` without recompilation.
 
     Uses the inline path (calling ``ppl-compile`` binary + cmake directly) when
     the ``ppl-compile`` binary is found.  Falls back to shelling out to
-    ``ppl_compile.py`` as a subprocess otherwise.
+    ``ppl_compile.py`` as a subprocess otherwise (profiling unavailable in
+    fallback mode).
 
     Compilation is device-agnostic — no device ID is needed here.
 
-    Returns a dict with paths: {"pl", "kernel_so", "wrapper_so", "workdir"}.
+    Returns a dict with paths:
+        {"pl", "kernel_so", "wrapper_so", "test_case", "workdir"}.
+    ``test_case`` may be ``None`` when built via the fallback path.
     """
     logger.warning("[TPU]: ppl_runner->build()")
     ppl_root = _get_ppl_root()
@@ -453,17 +468,20 @@ def build(
     pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
     kernel_so = os.path.join(workdir, "lib", "libkernel.so")
     wrapper_so = os.path.join(workdir, "lib", f"{spec.kernel_name}_py.so")
+    test_case = os.path.join(workdir, "test_case")
 
-    # Cache: skip compilation if artifacts exist and .pl source hasn't changed.
     cached = False
-    if os.path.isfile(kernel_so) and os.path.isfile(wrapper_so) and os.path.isfile(pl_path):
+    if (os.path.isfile(kernel_so) and os.path.isfile(wrapper_so)
+            and os.path.isfile(pl_path)):
         with open(pl_path) as f:
             if f.read() == pl_content:
                 cached = True
                 logger.warning("[TPU]: ppl_runner->build() cache HIT, skipping compilation")
 
     if cached:
-        return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
+        tc = test_case if os.path.isfile(test_case) else None
+        return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so,
+                "test_case": tc, "workdir": workdir}
 
     with open(pl_path, "w") as f:
         f.write(pl_content)
@@ -472,7 +490,8 @@ def build(
     compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
     if os.path.isfile(compiler_bin):
         _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
-        _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True, verbose=verbose)
+        _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
+                         autotune=True, verbose=verbose)
         _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
     else:
         logger.warning("[TPU]: ppl-compile binary not found, falling back to ppl_compile.py subprocess")
@@ -507,71 +526,16 @@ def build(
     )
     if not os.path.isfile(wrapper_so):
         raise RuntimeError(f"wrapper .so not found at {wrapper_so}")
+
+    tc = test_case if os.path.isfile(test_case) else None
     logger.warning(f"[TPU]: ppl_runner->build() done, kernel_so = {kernel_so}, wrapper_so = {wrapper_so}")
-    return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
+    return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so,
+            "test_case": tc, "workdir": workdir}
 
 
 # --------------------------------------------------------------------------- #
 # Profiling                                                                    #
 # --------------------------------------------------------------------------- #
-
-
-def build_for_profile(
-    spec: PPLGemmSpec,
-    workdir: str,
-    *,
-    chip: str = "sg2260e",
-    opt: str = "O3",
-    verbose: bool = False,
-) -> dict[str, str]:
-    """Build with ``--autotune`` for profiling (no ctypes wrapper needed).
-
-    Compilation is device-agnostic — no device ID is needed here.
-
-    Returns a dict with paths: {"pl", "kernel_so", "test_case", "workdir"}.
-    """
-    logger.warning("[TPU]: ppl_runner->build_for_profile()")
-    ppl_root = _get_ppl_root()
-    chip_arch = _resolve_chip_arch(ppl_root, chip)
-
-    os.makedirs(workdir, exist_ok=True)
-    pl_content = emit_pl(spec)
-    pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
-    kernel_so = os.path.join(workdir, "lib", "libkernel.so")
-    test_case = os.path.join(workdir, "test_case")
-
-    cached = False
-    if os.path.isfile(kernel_so) and os.path.isfile(test_case) and os.path.isfile(pl_path):
-        with open(pl_path) as f:
-            if f.read() == pl_content:
-                cached = True
-                logger.warning("[TPU]: build_for_profile() cache HIT")
-
-    if cached:
-        return {"pl": pl_path, "kernel_so": kernel_so, "test_case": test_case, "workdir": workdir}
-
-    with open(pl_path, "w") as f:
-        f.write(pl_content)
-
-    compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
-    if not os.path.isfile(compiler_bin):
-        raise RuntimeError(
-            "Profiling requires the ppl-compile binary. "
-            "Ensure $PPL_PROJECT_ROOT/bin/ppl-compile exists."
-        )
-
-    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
-    _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
-                     autotune=True, verbose=verbose)
-    _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
-
-    if not os.path.isfile(kernel_so):
-        raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
-    if not os.path.isfile(test_case):
-        raise RuntimeError(f"test_case binary not produced at {test_case}")
-
-    logger.warning(f"[TPU]: build_for_profile() done, test_case = {test_case}")
-    return {"pl": pl_path, "kernel_so": kernel_so, "test_case": test_case, "workdir": workdir}
 
 
 def _parse_summary(summary_path: str) -> float:
@@ -588,41 +552,16 @@ def _parse_summary(summary_path: str) -> float:
     return 0.0
 
 
-def run_profiling(
-    spec: PPLGemmSpec,
-    workdir: str,
-    *,
-    chip: str = "sg2260e",
-    devid: int | None = None,
-    book_keeping: int = 1,
-    verbose: bool = False,
-) -> dict[str, Any]:
-    """Build with profiling instrumentation, run test_case, collect and display results.
+def _collect_profile_data(profiling_dir: str, *, verbose: bool = False) -> dict[str, Any]:
+    """Process ``cdm_profile_data_dev*`` files with ``bigTpuProfile``.
 
-    Returns a dict: {"profiling_dir", "overall_us", "summary_path", "pftrace_path"}.
+    If ``bigTpuProfile`` fails (e.g. timestamp normalization errors), the raw
+    ``cdm_profile_data_dev*`` files are still returned so the user can inspect
+    or reprocess them manually.  A warning is printed instead of raising.
     """
     import glob as _glob
     import sys as _sys
-
-    if devid is None:
-        devid = get_tpu_device()
-    paths = build_for_profile(spec, workdir, chip=chip, verbose=verbose)
-    ppl_root = _get_ppl_root()
-    chip_arch = _resolve_chip_arch(ppl_root, chip)
-
-    _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
-    os.environ["PPL_DEVID"] = str(devid)
-    os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
-    os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
-
-    profiling_dir = os.path.join(workdir, "profiling")
-    os.makedirs(profiling_dir, exist_ok=True)
-
-    test_case = paths["test_case"]
-    logger.warning(f"[TPU]: running test_case for profiling in {profiling_dir}")
-    ret = subprocess.run([test_case, str(devid)], cwd=profiling_dir)
-    if ret.returncode != 0:
-        raise RuntimeError(f"test_case exited with code {ret.returncode}")
+    import warnings as _warnings
 
     cdm_files = sorted(_glob.glob(os.path.join(profiling_dir, "cdm_profile_data_dev*")))
     if not cdm_files:
@@ -631,6 +570,7 @@ def run_profiling(
     overall_us = 0.0
     summary_path = ""
     pftrace_path = ""
+    parse_ok = True
 
     for i, cdm_file in enumerate(cdm_files):
         out_dir = os.path.join(profiling_dir, f"out_{i}")
@@ -639,9 +579,15 @@ def run_profiling(
             print(f"[ppl_runner] {' '.join(cmd)}")
         ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if ret.returncode != 0:
-            print(ret.stdout, end="", file=_sys.stderr)
-            print(ret.stderr, end="", file=_sys.stderr)
-            raise RuntimeError(f"bigTpuProfile failed: {' '.join(cmd)}")
+            parse_ok = False
+            _warnings.warn(
+                f"bigTpuProfile failed for {cdm_file} (exit {ret.returncode}). "
+                f"Raw data preserved at {cdm_file} for manual inspection.\n"
+                f"stdout: {ret.stdout.strip()}\nstderr: {ret.stderr.strip()}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
 
         sp = os.path.join(out_dir, "summary.txt")
         overall_us += _parse_summary(sp)
@@ -650,13 +596,17 @@ def run_profiling(
             pf = os.path.join(out_dir, "perfetto.pftrace")
             if os.path.isfile(pf):
                 pftrace_path = pf
-
         if os.path.isfile(sp):
             print(open(sp).read(), file=_sys.stderr)
 
     print("=" * 60, file=_sys.stderr)
-    print(f"  Overall kernel time: {overall_us:.2f} us", file=_sys.stderr)
+    if parse_ok:
+        print(f"  Overall kernel time: {overall_us:.2f} us", file=_sys.stderr)
+    else:
+        print("  WARNING: bigTpuProfile failed to parse some/all data", file=_sys.stderr)
+        print("  Raw cdm files are preserved for manual inspection.", file=_sys.stderr)
     print(f"  Profiling data:      {profiling_dir}", file=_sys.stderr)
+    print(f"  Raw cdm files:       {', '.join(cdm_files)}", file=_sys.stderr)
     if pftrace_path:
         print(f"  Perfetto trace:      {pftrace_path}", file=_sys.stderr)
         print("  Open in Perfetto UI: https://ui.perfetto.dev/", file=_sys.stderr)
@@ -667,7 +617,72 @@ def run_profiling(
         "overall_us": overall_us,
         "summary_path": summary_path,
         "pftrace_path": pftrace_path,
+        "cdm_files": cdm_files,
+        "parse_ok": parse_ok,
     }
+
+
+def run_profiling(
+    workdir: str,
+    *,
+    spec: PPLGemmSpec | None = None,
+    devid: int | None = None,
+    book_keeping: int = 1,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Run kernel with hardware profiling via the ctypes execution path.
+
+    Uses the same ``PPLKernel`` ctypes wrapper as normal kernel execution —
+    no separate ``test_case`` binary needed.  ``tpudnnEnableProfile()`` is
+    called on the device handle before the kernel launch so that a single
+    run produces both a result tensor and profiling data.
+
+    When *spec* is given, its M/K/N are used for the profiling run (important
+    for dynamic-shape kernels).  Otherwise defaults to 1024x1024x1024.
+
+    Returns ``{"profiling_dir", "overall_us", "summary_path", "pftrace_path"}``.
+    """
+    if devid is None:
+        devid = get_tpu_device()
+
+    M = spec.M if spec else 1024
+    K = spec.K if spec else 1024
+    N = spec.N if spec else 1024
+    in_dtype = spec.in_dtype if spec else "fp16"
+    kernel_name = spec.kernel_name if spec else "tl_gemm_relu"
+
+    kernel_so = os.path.join(workdir, "lib", "libkernel.so")
+    wrapper_so = os.path.join(workdir, "lib", f"{kernel_name}_py.so")
+    if not os.path.isfile(kernel_so) or not os.path.isfile(wrapper_so):
+        raise RuntimeError(
+            f"Kernel not built in {workdir} — run build() first. "
+            f"Missing: {kernel_so if not os.path.isfile(kernel_so) else wrapper_so}"
+        )
+
+    paths = {"kernel_so": kernel_so, "wrapper_so": wrapper_so, "workdir": workdir}
+    profiling_dir = os.path.join(workdir, "profiling")
+    os.makedirs(profiling_dir, exist_ok=True)
+
+    os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
+    os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
+
+    _ensure_tpu_env(kernel_name)
+    os.environ["PPL_KERNEL_PATH"] = kernel_so
+
+    kernel = PPLKernel(paths, device=devid, kernel_name=kernel_name)
+    kernel.init()
+    kernel.enable_profile(book_keeping=book_keeping)
+    kernel._profile_dir = profiling_dir
+
+    dtype = torch.float16 if in_dtype == "fp16" else torch.bfloat16
+    a = torch.randn(M, K, dtype=dtype)
+    b = torch.randn(K, N, dtype=dtype)
+
+    logger.warning(f"[TPU]: profiling {kernel_name} M={M} K={K} N={N} in {profiling_dir}")
+    kernel.run(a, b)
+    kernel.close()
+
+    return _collect_profile_data(profiling_dir, verbose=verbose)
 
 
 # --------------------------------------------------------------------------- #
@@ -771,7 +786,13 @@ class PPLKernel:
         ]
         launch.restype = ctypes.c_int
         self._launch = launch
+        L.py_enable_profile.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        L.py_enable_profile.restype = ctypes.c_int
+        L.py_disable_profile.argtypes = [ctypes.c_void_p]
+        L.py_disable_profile.restype = ctypes.c_int
         self.handle: Any = None
+        self._profile_dir: str | None = None
+        self._profile_active: bool = False
 
     def init(self) -> None:
         self.handle = self.lib.py_init_device(self.device)
@@ -780,8 +801,23 @@ class PPLKernel:
 
     def close(self) -> None:
         if self.handle:
+            if self._profile_active:
+                self.lib.py_disable_profile(self.handle)
+                self._profile_active = False
+                self._move_profile_data()
             self.lib.py_release_device(self.handle)
             self.handle = None
+
+    def _move_profile_data(self) -> None:
+        """Move ``cdm_profile_data_dev*`` from cwd to ``_profile_dir``."""
+        if not self._profile_dir:
+            return
+        import glob as _glob
+        for src in _glob.glob("cdm_profile_data_dev*"):
+            dst = os.path.join(self._profile_dir, os.path.basename(src))
+            if os.path.exists(dst):
+                shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+            shutil.move(src, dst)
 
     def __enter__(self):
         self.init()
@@ -789,6 +825,29 @@ class PPLKernel:
 
     def __exit__(self, *a):
         self.close()
+
+    def enable_profile(self, max_record_num: int = 0, book_keeping: int = 1) -> None:
+        """Call ``tpudnnEnableProfile`` on the device handle.
+
+        ``BMLIB_ENABLE_ALL_PROFILE=1`` must be set in the environment *before*
+        ``init()`` (i.e. before ``tpuRtInit``).  This method calls the runtime
+        API to start recording profiling data for subsequent kernel launches.
+        """
+        if not self.handle:
+            raise RuntimeError("Call init() before enable_profile()")
+        if max_record_num <= 0:
+            env_val = os.environ.get("PROFILE_RECORD_SIZE", "")
+            max_record_num = int(env_val) if env_val else 131072
+        ret = self.lib.py_enable_profile(self.handle, max_record_num, book_keeping)
+        if ret != 0:
+            raise RuntimeError(f"tpudnnEnableProfile failed with code {ret}")
+        self._profile_active = True
+
+    def collect_profile(self, *, verbose: bool = False) -> dict[str, Any]:
+        """Process ``cdm_profile_data_dev*`` files with ``bigTpuProfile``."""
+        if not self._profile_dir:
+            raise RuntimeError("Profiling not enabled — no profile_dir set")
+        return _collect_profile_data(self._profile_dir, verbose=verbose)
 
     def _h2d(self, t: torch.Tensor) -> int:
         t = t.contiguous()

@@ -24,7 +24,9 @@ from typing import Any, Callable
 
 import torch
 
-from tilelang.tpu.ppl_runner import PPLKernel, PPLGemmSpec, build, emit_pl, get_tpu_device
+from tilelang.tpu.ppl_runner import (
+    PPLKernel, PPLGemmSpec, build, emit_pl, get_tpu_device, _collect_profile_data,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,7 @@ class TPUKernel:
         self._runtime: PPLKernel | None = None
         self._a: torch.Tensor | None = None
         self._b: torch.Tensor | None = None
+        self._profile_config: dict[str, Any] | None = None
 
     @property
     def device(self) -> int:
@@ -85,6 +88,10 @@ class TPUKernel:
                 self.paths, device=self.device, kernel_name=self.spec.kernel_name
             )
             rt.init()
+            if self._profile_config is not None:
+                cfg = self._profile_config
+                rt.enable_profile(cfg["max_record_num"], cfg["book_keeping"])
+                rt._profile_dir = cfg["dir"]
             self._runtime = rt
         return self._runtime
 
@@ -93,6 +100,50 @@ class TPUKernel:
         b = b.detach().cpu().contiguous()
         self._a, self._b = a, b
         return self._ensure_runtime().run(a, b)
+
+    def enable_profile(
+        self,
+        *,
+        max_record_num: int = 0,
+        book_keeping: int = 1,
+        profiling_dir: str | None = None,
+    ) -> None:
+        """Enable hardware profiling for subsequent kernel runs.
+
+        Must be called *before* the first ``__call__`` (or after ``close()``).
+        Sets ``BMLIB_ENABLE_ALL_PROFILE=1`` so that ``tpuRtInit`` enables the
+        profiling subsystem, then ``tpudnnEnableProfile`` is called on the
+        handle during device init.
+
+        After the kernel run, call ``collect_profile()`` to process the data.
+        """
+        os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
+        os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
+        pd = profiling_dir or os.path.join(self.paths["workdir"], "profiling")
+        os.makedirs(pd, exist_ok=True)
+        self._profile_config = {
+            "max_record_num": max_record_num,
+            "book_keeping": book_keeping,
+            "dir": pd,
+        }
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+
+    def collect_profile(self, *, verbose: bool = False) -> dict[str, Any]:
+        """Process profiling data from the last profiled run.
+
+        Closes the device handle first — the TPU runtime flushes
+        ``cdm_profile_data_dev*`` files during handle destruction.
+
+        Returns ``{"profiling_dir", "overall_us", "summary_path", "pftrace_path"}``.
+        """
+        if self._profile_config is None:
+            raise RuntimeError("Profiling not enabled — call enable_profile() first")
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+        return _collect_profile_data(self._profile_config["dir"], verbose=verbose)
 
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         return emit_pl(self.spec)

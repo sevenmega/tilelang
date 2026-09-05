@@ -43,6 +43,12 @@ class PPLKernelAdapter:
     def get_host_source(self) -> str:
         return "// PPL backend: no separate host source"
 
+    def enable_profile(self, **kwargs: Any) -> None:
+        self._tpu_kernel.enable_profile(**kwargs)
+
+    def collect_profile(self, **kwargs: Any) -> dict:
+        return self._tpu_kernel.collect_profile(**kwargs)
+
     def get_profiler(self, **kwargs: Any):
         return self._tpu_kernel.get_profiler(**kwargs)
 

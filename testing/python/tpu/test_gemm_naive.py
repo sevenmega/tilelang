@@ -49,6 +49,10 @@ if __name__ == "__main__":
     import sys
     if "--run" in sys.argv:
         import torch
+        do_profile = "--profile" in sys.argv
+        if do_profile:
+            kernel.adapter.enable_profile()
+
         a = torch.randn(M, K, dtype=torch.float16)
         b = torch.randn(K, N, dtype=torch.float16)
         c = kernel(a, b)
@@ -60,8 +64,5 @@ if __name__ == "__main__":
             print(f"FAIL: max diff = {max_diff}")
             sys.exit(1)
 
-    if "--profile" in sys.argv:
-        from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
-        spec = PPLGemmSpec(M=M, K=K, N=N, block_m=64, block_k=32, block_n=64)
-        workdir = f"/tmp/tilelang_tpu_tl_gemm_relu_{M}_{K}_{N}_profile"
-        run_profiling(spec, workdir, verbose="--verbose" in sys.argv)
+        if do_profile:
+            kernel.adapter.collect_profile(verbose="--verbose" in sys.argv)

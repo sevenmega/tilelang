@@ -124,35 +124,41 @@ Currently: fp16 GEMM with fp32 accumulation, optional ReLU activation, square ti
 
 ## Profiling
 
-The TPU backend supports hardware profiling via PPL's `--autotune` compilation
-mode and `bigTpuProfile`.  Profiling measures TIU/DMA utilization, parallelism,
-bandwidth, and per-operation timing on the actual TPU hardware.
+Profiling uses the same ctypes execution path as normal kernel runs — no
+separate ``test_case`` binary needed.  When profiling is enabled,
+``tpudnnEnableProfile()`` is called on the device handle before kernel launch,
+so a single run produces both a result tensor (for correctness checking) and
+hardware profiling data.
 
 ### Quick start
 
 ```bash
 source /path/to/ppl_.../envsetup.sh
-python testing/python/tpu/test_gemm_naive.py --profile
+
+# Correctness test only
+python testing/python/tpu/test_gemm_naive.py --run
+
+# Correctness test + profiling in a single execution
+python testing/python/tpu/test_gemm_naive.py --run --profile
 ```
 
-This will:
+When ``--profile`` is used, the test:
 
-1. Compile the kernel with profiling instrumentation (`ppl-compile --autotune`)
-2. Run the `test_case` binary on the TPU with profiling enabled
-3. Process the profiling data with `bigTpuProfile`
-4. Print a summary table and save detailed data
-
-You can combine `--run` (correctness test) and `--profile` (profiling) in the same invocation.
+1. Calls ``kernel.enable_profile()`` before the first run
+2. Runs the kernel once via ctypes — both correctness and profiling happen
+3. Calls ``kernel.collect_profile()`` to process data with ``bigTpuProfile``
+4. Prints a summary table and saves detailed data
 
 ### Profiling data location
 
-Profiling artifacts are saved under a `_profile` suffixed workdir in `/tmp/`:
+Profiling artifacts are saved in the build workdir:
 
 ```
-/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_profile/
+/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024/
 ├── tl_gemm_relu.pl              # PPL kernel source
-├── test_case                    # profiling-instrumented binary
-├── lib/libkernel.so             # device kernel
+├── lib/
+│   ├── libkernel.so             # device kernel
+│   └── tl_gemm_relu_py.so      # ctypes wrapper (includes py_enable_profile)
 └── profiling/                   # profiling run output
     ├── cdm_profile_data_dev*    # raw hardware profile data
     └── out_0/
@@ -168,15 +174,36 @@ detailed timeline view of TIU and DMA operations.  Alternatively, install the
 
 ### Python API
 
+#### Unified path (recommended)
+
+Enable profiling on the kernel object, then run normally.  One execution does
+both correctness checking and profiling:
+
+```python
+kernel = tilelang.compile(program, target="tpu", out_idx=[2])
+
+# Enable profiling before the run
+kernel.adapter.enable_profile()
+
+# Single run — correctness + profiling
+c = kernel(a, b)
+
+# Collect profiling data
+result = kernel.adapter.collect_profile(verbose=True)
+print(result["overall_us"])       # Overall kernel time in microseconds
+print(result["pftrace_path"])     # Path to .pftrace file
+```
+
+#### Standalone convenience function
+
+For quick one-off profiling without a kernel object:
+
 ```python
 from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
 
+workdir = "/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024"
 spec = PPLGemmSpec(M=1024, K=1024, N=1024, block_m=64, block_k=32, block_n=64)
-workdir = "/tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_profile"
-result = run_profiling(spec, workdir)
-print(result["overall_us"])       # Overall kernel time in microseconds
-print(result["profiling_dir"])    # Path to profiling artifacts
-print(result["pftrace_path"])     # Path to .pftrace file
+result = run_profiling(workdir, spec=spec)
 ```
 
 ### Environment variables
@@ -185,19 +212,11 @@ print(result["pftrace_path"])     # Path to .pftrace file
 |----------|--------|---------|-------------|
 | `TPU_VISIBLE_DEVICES` | integer | 0 | TPU device ID (like `CUDA_VISIBLE_DEVICES`). All TPU functions read this as the default device. |
 | `PROFILE_BOOK_KEEPING` | 0, 1, 2 | 1 | Profiling detail level passed to `tpudnnEnableProfile()`. Higher values capture more detail at the cost of overhead. |
-| `BMLIB_ENABLE_ALL_PROFILE` | 0, 1 | 0 | Set to 1 to enable hardware profiling. Automatically set by `run_profiling()`. |
-
-### Caching
-
-The profiling build uses a separate workdir from the normal build (suffixed
-with `_profile`).  The same disk cache logic applies: if the `.pl` source and
-`test_case` binary already exist, compilation is skipped.  The `test_case`
-binary is always re-run to collect fresh profiling data.
+| `BMLIB_ENABLE_ALL_PROFILE` | 0, 1 | 0 | Set to 1 to enable hardware profiling. Automatically set by ``enable_profile()``. |
 
 ### Requirements
 
 - `bigTpuProfile` Python package (`pip install bigTpuProfile`)
-- `ppl-compile` binary (the ppl_compile.py fallback does not support profiling)
 
 ## Configuration
 

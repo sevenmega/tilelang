@@ -60,10 +60,9 @@ print("Dynamic-shape GEMM+ReLU compilation for TPU target succeeded.")
 if __name__ == "__main__":
     import sys
     if "--run" in sys.argv:
+        import os
         import torch
         do_profile = "--profile" in sys.argv
-        if do_profile:
-            from tilelang.tpu.ppl_runner import run_profiling, PPLGemmSpec
 
         test_shapes = [
             (1024, 1024, 1024),
@@ -72,6 +71,11 @@ if __name__ == "__main__":
 
         for M_val, N_val, K_val in test_shapes:
             print(f"\n--- Testing M={M_val}, N={N_val}, K={K_val} ---")
+            if do_profile:
+                workdir = "/tmp/tilelang_tpu_tl_gemm_relu_dyn_dyn_dyn"
+                profile_dir = os.path.join(workdir, f"profiling_{M_val}_{N_val}_{K_val}")
+                kernel.adapter.enable_profile(profiling_dir=profile_dir)
+
             a = torch.randn(M_val, K_val, dtype=torch.float16)
             b = torch.randn(K_val, N_val, dtype=torch.float16)
             c = kernel(a, b)
@@ -85,8 +89,6 @@ if __name__ == "__main__":
 
             if do_profile:
                 print(f"\n--- Profiling M={M_val}, N={N_val}, K={K_val} ---")
-                spec = PPLGemmSpec(M=M_val, K=K_val, N=N_val, block_m=64, block_k=32, block_n=64)
-                workdir = f"/tmp/tilelang_tpu_tl_gemm_relu_{M_val}_{K_val}_{N_val}_profile"
-                run_profiling(spec, workdir, verbose="--verbose" in sys.argv)
+                kernel.adapter.collect_profile(verbose="--verbose" in sys.argv)
 
         print("\nAll dynamic shape tests passed.")

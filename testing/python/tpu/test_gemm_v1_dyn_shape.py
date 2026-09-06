@@ -1,61 +1,60 @@
 """Dynamic-shape GEMM+ReLU test for the TPU backend.
 
 Demonstrates a single kernel definition that supports dynamic M, N, K.
-The same code structure works on both TPU (target="tpu") and GPU
-(target="cuda") — only the target string changes.
+The PPL __KERNEL__ function takes M, K, N as runtime int arguments, so
+one compiled kernel handles any shape whose dimensions are divisible by
+the tile sizes.
 
-Uses T.dynamic() to declare symbolic shape dimensions.  The PPL __KERNEL__
-function takes M, K, N as runtime int arguments, so one compiled kernel
-handles any shape whose dimensions are divisible by the tile sizes.
+Uses ``@tilelang.jit(target="tpu")`` with ``T.const()`` for compile-time
+shape specialization.  The resulting TIR has only 2 spatial levels
+(``bx``, ``by``) — no GPU-specific ``tx``/``ty``/``tz`` thread bindings.
 """
 import tilelang
 import tilelang.language as T
 
 
+@tilelang.jit(target="tpu")
 def matmul_dyn_shape(
-    M,
-    N,
-    K,
-    block_M=64,
-    block_N=64,
-    block_K=32,
-    in_dtype="float16",
-    accum_dtype="float32",
+    A, B,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 32,
+    dtype: T.dtype = T.float16,
+    accum_dtype: T.dtype = T.float32,
 ):
-    @T.prim_func
-    def main(
-        A: T.Tensor((M, K), in_dtype),
-        B: T.Tensor((K, N), in_dtype),
-        C: T.Tensor((M, N), in_dtype),
-    ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M)) as (bx, by):
-            A_local = T.alloc_local((block_M, block_K), in_dtype)
-            B_local = T.alloc_local((block_K, block_N), in_dtype)
-            C_local = T.alloc_local((block_M, block_N), accum_dtype)
+    M, N, K = T.const("M, N, K")
 
-            T.clear(C_local)
+    A: T.Tensor((M, K), dtype)
+    B: T.Tensor((K, N), dtype)
+    C = T.empty((M, N), dtype)
 
-            for k in T.serial(T.ceildiv(K, block_K)):
-                T.copy(A[by * block_M, k * block_K], A_local)
-                T.copy(B[k * block_K, bx * block_N], B_local)
-                T.gemm(A_local, B_local, C_local)
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M)) as (bx, by):
+        A_local = T.alloc_local((block_M, block_K), dtype)
+        B_local = T.alloc_local((block_K, block_N), dtype)
+        C_local = T.alloc_local((block_M, block_N), accum_dtype)
 
-            for i, j in T.Parallel(block_M, block_N):
-                C_local[i, j] = T.max(C_local[i, j], 0)
+        T.clear(C_local)
 
-            T.copy(C_local, C[by * block_M, bx * block_N])
+        for k in T.serial(T.ceildiv(K, block_K)):
+            T.copy(A[by * block_M, k * block_K], A_local)
+            T.copy(B[k * block_K, bx * block_N], B_local)
+            T.gemm(A_local, B_local, C_local)
 
-    return main
+        for i, j in T.Parallel(block_M, block_N):
+            C_local[i, j] = T.max(C_local[i, j], 0)
+
+        T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return C
 
 
-# All three dimensions are dynamic
-M = T.dynamic("M")
-N = T.dynamic("N")
-K = T.dynamic("K")
+M, N, K = 1024, 1024, 1024
 
-program = matmul_dyn_shape(M, N, K, block_M=64, block_N=64, block_K=32)
-kernel = tilelang.compile(program, target="tpu", out_idx=[2])
-print("Dynamic-shape GEMM+ReLU compilation for TPU target succeeded.")
+print("TIR:")
+print(matmul_dyn_shape.get_tir(M=M, N=N, K=K).script())
+
+kernel = matmul_dyn_shape.compile(M=M, N=N, K=K)
+print("\nDynamic-shape GEMM+ReLU compilation for TPU target succeeded.")
 
 if __name__ == "__main__":
     import sys
@@ -72,7 +71,7 @@ if __name__ == "__main__":
         for M_val, N_val, K_val in test_shapes:
             print(f"\n--- Testing M={M_val}, N={N_val}, K={K_val} ---")
             if do_profile:
-                workdir = "/tmp/tilelang_tpu_tl_gemm_relu_dyn_dyn_dyn"
+                workdir = kernel.adapter._tpu_kernel.paths["workdir"]
                 profile_dir = os.path.join(workdir, f"profiling_{M_val}_{N_val}_{K_val}")
                 kernel.adapter.enable_profile(profiling_dir=profile_dir)
 

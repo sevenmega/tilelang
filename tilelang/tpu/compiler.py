@@ -195,6 +195,7 @@ def compile_gemm(
     relu: bool = True,
     in_dtype: str = "fp16",
     core_num: int = 1,
+    num_stages: int = 1,
     workdir: str | None = None,
     kernel_name: str = "tl_gemm_relu",
     **build_kw: Any,
@@ -220,14 +221,15 @@ def compile_gemm(
         M=build_M, K=build_K, N=build_N,
         block_m=block_m, block_k=block_k, block_n=block_n,
         relu=relu, in_dtype=in_dtype, core_num=core_num,
-        kernel_name=kernel_name,
+        num_stages=num_stages, kernel_name=kernel_name,
     )
     if workdir is None:
         tag_m, tag_k, tag_n = _shape_tag(M), _shape_tag(K), _shape_tag(N)
         mc_tag = f"_mc{core_num}" if core_num > 1 else ""
+        nb_tag = f"_nb{num_stages}" if num_stages > 1 else ""
         workdir = os.path.join(
             "/tmp",
-            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}",
+            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}{nb_tag}",
         )
     paths = build(spec, workdir, **build_kw)
     return TPUKernel(spec, paths)
@@ -373,6 +375,36 @@ def _core_num_from_func(func: Any) -> int:
     return 1
 
 
+def _num_stages_from_func(func: Any) -> int:
+    """Detect pipeline num_stages from T.Pipelined For-node annotations.
+
+    ``T.Pipelined(extent, num_stages=N)`` stores the stage count in
+    ``For.annotations["num_stages"]``.  Returns 1 (no pipelining) if absent.
+    """
+    try:
+        from tvm import tirx as _tir
+
+        stages: list[int] = []
+
+        def visit(node: Any) -> Any:
+            if type(node).__name__ != "For":
+                return None
+            ann = dict(node.annotations) if node.annotations else {}
+            if "num_stages" in ann:
+                try:
+                    stages.append(int(ann["num_stages"]))
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        _tir.stmt_functor.post_order_visit(func.body, visit)
+        if stages and stages[0] > 1:
+            return stages[0]
+    except Exception:
+        pass
+    return 1
+
+
 def compile(
     func: Any,
     *,
@@ -384,6 +416,7 @@ def compile(
     block_n: int | None = None,
     in_dtype: str | None = None,
     core_num: int | None = None,
+    num_stages: int | None = None,
     **build_kw: Any,
 ) -> TPUKernel:
     """Compile a *lowered* tilelang PrimFunc for the TPU (GEMM[+ReLU] codegen).
@@ -412,6 +445,7 @@ def compile(
     ir_in = _in_dtype_from_func(func)
     ir_bm, ir_bk, ir_bn = _tiles_from_func(func, ir_in)
     ir_core = _core_num_from_func(func)
+    ir_stages = _num_stages_from_func(func)
     return compile_gemm(
         M, K, N,
         block_m=block_m if block_m is not None else ir_bm,
@@ -420,5 +454,6 @@ def compile(
         relu=relu, workdir=workdir,
         in_dtype=in_dtype if in_dtype is not None else ir_in,
         core_num=core_num if core_num is not None else ir_core,
+        num_stages=num_stages if num_stages is not None else ir_stages,
         **build_kw,
     )

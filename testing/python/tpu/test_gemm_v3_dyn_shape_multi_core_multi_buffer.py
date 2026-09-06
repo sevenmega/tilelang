@@ -1,29 +1,36 @@
-"""Multi-core GEMM+ReLU test for the TPU backend.
+"""Multi-core double-buffered GEMM+ReLU test for the TPU backend.
 
-Extends test_gemm_v1_dyn_shape with a 3rd T.Kernel axis representing the
-TPU core dimension.  The M dimension is partitioned across ``core_num``
-cores (SG2260E has 4); each core computes its slice of output rows
-independently (no inter-core sync needed).
+Extends test_gemm_v2_dyn_shape_multi_core with explicit double-buffering
+via ``T.Pipelined(extent, num_stages=2)``.  The K-loop uses a
+prologue/mainloop/epilogue pattern with ``parallel_start``/``parallel_end``
+to overlap DMA loads into one buffer set while TIU computes on the other.
 
-The 3-axis T.Kernel grid:
+The 3-axis T.Kernel grid (same as v2):
   - bx: N-tile index (all cores iterate the full N dimension)
   - by: M-tile index within this core's slice
   - bc: core index (maps to get_block_index() in emitted PPL)
+
+Key difference from v2: ``T.Pipelined(extent, num_stages=2)`` replaces
+``T.serial(extent)`` for the K-loop.  The codegen detects ``num_stages``
+from TIR annotations and emits explicit ping-pong buffer management
+instead of relying on PPL's ``enable_pipeline()`` auto-duplication.
 """
 import tilelang
 import tilelang.language as T
 
 
 CORE_NUM = 4
+NUM_STAGES = 2
 
 
 @tilelang.jit(target="tpu")
-def matmul_multicore(
+def matmul_multicore_multibuf(
     A, B,
     block_M: int = 64,
     block_N: int = 64,
     block_K: int = 32,
     core_num: int = CORE_NUM,
+    num_stages: int = NUM_STAGES,
     dtype: T.dtype = T.float16,
     accum_dtype: T.dtype = T.float32,
 ):
@@ -47,7 +54,7 @@ def matmul_multicore(
         with T.If(by_global * block_M < M), T.Then():
             T.clear(C_local)
 
-            for k in T.serial(T.ceildiv(K, block_K)):
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(A[by_global * block_M, k * block_K], A_local)
                 T.copy(B[k * block_K, bx * block_N], B_local)
                 T.gemm(A_local, B_local, C_local)
@@ -63,10 +70,11 @@ def matmul_multicore(
 M, N, K = 1024, 1024, 1024
 
 print("TIR:")
-print(matmul_multicore.get_tir(M=M, N=N, K=K).script())
+print(matmul_multicore_multibuf.get_tir(M=M, N=N, K=K).script())
 
-kernel = matmul_multicore.compile(M=M, N=N, K=K)
-print(f"\nMulti-core (core_num={CORE_NUM}) GEMM+ReLU compilation succeeded.")
+kernel = matmul_multicore_multibuf.compile(M=M, N=N, K=K)
+print(f"\nMulti-core (core_num={CORE_NUM}) double-buffered (num_stages={NUM_STAGES}) "
+      f"GEMM+ReLU compilation succeeded.")
 print("\nGenerated PPL kernel source:")
 print(kernel.get_kernel_source())
 
@@ -84,7 +92,8 @@ if __name__ == "__main__":
         ]
 
         for M_val, N_val, K_val in test_shapes:
-            print(f"\n--- Testing M={M_val}, N={N_val}, K={K_val} (core_num={CORE_NUM}) ---")
+            print(f"\n--- Testing M={M_val}, N={N_val}, K={K_val} "
+                  f"(core_num={CORE_NUM}, num_stages={NUM_STAGES}) ---")
             if do_profile:
                 workdir = kernel.adapter._tpu_kernel.paths["workdir"]
                 profile_dir = os.path.join(workdir, f"profiling_{M_val}_{N_val}_{K_val}")
@@ -105,4 +114,5 @@ if __name__ == "__main__":
                 print(f"\n--- Profiling M={M_val}, N={N_val}, K={K_val} ---")
                 kernel.adapter.collect_profile(verbose="--verbose" in sys.argv)
 
-        print(f"\nAll multi-core tests passed (core_num={CORE_NUM}).")
+        print(f"\nAll multi-core double-buffered tests passed "
+              f"(core_num={CORE_NUM}, num_stages={NUM_STAGES}).")

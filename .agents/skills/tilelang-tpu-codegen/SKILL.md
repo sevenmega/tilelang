@@ -33,17 +33,21 @@ tilelang DSL (@T.prim_func)
 
 ## PPL Template System
 
-Two templates in `ppl_runner.py`:
+Four templates in `ppl_runner.py`:
 
-- **`_PL_TEMPLATE`** — Single-core GEMM. Sequential M×N tile loops.
+- **`_PL_TEMPLATE`** — Single-core GEMM. Sequential M×N tile loops, `enable_pipeline()`.
 - **`_PL_TEMPLATE_MULTICORE`** — Multi-core GEMM. Adds `set_block_num_max()` /
   `get_block_num()` / `get_block_index()` and partitions M across cores.
+- **`_PL_TEMPLATE_MULTIBUF`** — Single-core double-buffer. Explicit ping-pong
+  buffers (`sub_left_0`/`sub_left_1`) with `parallel_start()`/`parallel_end()`.
+- **`_PL_TEMPLATE_MULTICORE_MULTIBUF`** — Multi-core + double-buffer.
 
-Both share the same format placeholders:
+All share the same format placeholders:
 `{kernel_name}`, `{in_type}` (fp16/bf16), `{block_m}`, `{block_k}`, `{block_n}`,
 `{do_relu_int}` (0 or 1), `{M}`, `{K}`, `{N}`.
 
-`emit_pl(spec)` dispatches: `spec.core_num > 1` → multi-core template.
+`emit_pl(spec)` dispatches on `spec.core_num` and `spec.num_stages`:
+`num_stages >= 2` → multi-buf variants; `core_num > 1` → multi-core variants.
 
 The `__TEST__` section is used by `ppl-compile` to generate a `test_case` binary.
 It uses the default M/K/N from the spec. The `__KERNEL__` takes M/K/N as runtime
@@ -59,6 +63,7 @@ class PPLGemmSpec:
     relu: bool = True
     in_dtype: str = "fp16"   # "fp16" or "bf16"
     core_num: int = 1        # 1 = single-core, >1 = multi-core
+    num_stages: int = 1      # 1 = single-buffer, 2 = double-buffer (explicit ping-pong)
     kernel_name: str = "tl_gemm_relu"
 ```
 
@@ -116,8 +121,8 @@ The PPL compiler's `GroupBlockNumAssignPass` MLIR pass auto-detects
 
 ## Build Cache
 
-Build outputs are cached under `/tmp/tilelang_tpu_<kernel>_<M>_<K>_<N>[_mc<N>]/`.
-The `_mc<N>` suffix distinguishes multi-core builds. Cache hit: `kernel_so` and
+Build outputs are cached under `/tmp/tilelang_tpu_<kernel>_<M>_<K>_<N>[_mc<N>][_nb<S>]/`.
+The `_mc<N>` suffix distinguishes multi-core builds; `_nb<S>` distinguishes multi-buffer. Cache hit: `kernel_so` and
 `wrapper_so` both exist → skip compilation.
 
 ## PPL Compile Invocation

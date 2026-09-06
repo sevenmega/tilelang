@@ -39,8 +39,11 @@ def matmul_naive(
 
 M, N, K = 1024, 1024, 1024
 
+print("TIR:")
+print(matmul_naive.get_tir(M=M, N=N, K=K).script())
+
 kernel = matmul_naive.compile(M=M, N=N, K=K)
-print("TPU Kernel Source:")
+print("\nTPU Kernel Source:")
 print(kernel.get_kernel_source())
 print("\nNaive GEMM+ReLU compilation for TPU target succeeded.")
 

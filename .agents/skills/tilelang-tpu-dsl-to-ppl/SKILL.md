@@ -62,6 +62,7 @@ Bare `with T.If(cond):` raises `IfThenElse frame should be either in ThenFrame`.
 | `T.gemm(A, B, C)` | `tiu::fmm2_nn(C, A, B, ..., result_add=true, ...)` | Matrix multiply-accumulate |
 | `T.max(val, 0)` (ReLU) | `do_relu=1` on last K iter of `fmm2_nn` | Fused into the matmul |
 | `T.serial(N)` | `for (int i = 0; i < N; i++)` | Sequential loop |
+| `T.Pipelined(N, num_stages=2)` | Prologue/mainloop/epilogue with `parallel_start`/`parallel_end` | Explicit double-buffer ping-pong |
 | `T.Parallel(M, N)` | Element-wise loop (fused into cast/store) | Parallel iteration hint |
 | `T.ceildiv(a, b)` | `(a + b - 1) / b` | Ceiling division |
 | `T.dynamic("M")` | Runtime `int M` parameter in `__KERNEL__` | Dynamic shape dim |
@@ -84,6 +85,67 @@ through the ctypes wrapper.
 
 Constraint: actual M/K/N must be divisible by block_M/K/N (no boundary handling).
 
+## Multi-Buffer Pipeline (T.Pipelined)
+
+### DSL Pattern
+
+```python
+for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
+    T.copy(A[by_global * block_M, k * block_K], A_local)
+    T.copy(B[k * block_K, bx * block_N], B_local)
+    T.gemm(A_local, B_local, C_local)
+```
+
+`num_stages` is stored in `For.annotations["num_stages"]` in TIR.
+`_num_stages_from_func()` detects it. `num_stages=1` (or `T.serial`) = no
+pipelining; `num_stages=2` = double-buffer with explicit ping-pong.
+
+### Emitted PPL Pattern (num_stages=2)
+
+Instead of PPL's `enable_pipeline()` auto-duplication, the codegen emits
+explicit double buffer arrays with manual ping-pong indexing:
+
+```c
+// Two sets of input tiles
+auto sub_left_0 = tensor<fp16>(left_max_shape);
+auto sub_left_1 = tensor<fp16>(left_max_shape);
+auto sub_right_0 = tensor<fp16>(right_max_shape);
+auto sub_right_1 = tensor<fp16>(right_max_shape);
+
+// Prologue: load first tile pair into buffer 0
+dma::load(sub_left_0, ...);
+dma::load(sub_right_0, ...);
+
+// Main loop: overlap DMA[i+1] with TIU[i]
+int ping = 0;
+for (int ki = 0; ki < K_iters - 1; ki++) {
+    parallel_start();
+    if (ping == 0) {
+        dma::load(sub_left_1, ...next...);  // load into buf 1
+        tiu::fmm2_nn(sub_res, sub_left_0, sub_right_0, ...);  // compute from buf 0
+    } else {
+        dma::load(sub_left_0, ...next...);  // load into buf 0
+        tiu::fmm2_nn(sub_res, sub_left_1, sub_right_1, ...);  // compute from buf 1
+    }
+    parallel_end();
+    ping = 1 - ping;
+}
+
+// Epilogue: compute last iteration (do_relu only here)
+```
+
+Key: `parallel_start()`/`parallel_end()` bracket concurrent DMA+TIU regions.
+`do_relu` is only applied in the epilogue (last K iteration) to avoid
+corrupting the fp32 accumulator on intermediate partial sums.
+
+### Combined Multi-Core + Multi-Buffer
+
+```python
+for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
+```
+inside a 3-axis `T.Kernel` produces `_PL_TEMPLATE_MULTICORE_MULTIBUF` —
+both M-partitioning across cores AND explicit double-buffering.
+
 ## What the Codegen Extracts from TIR
 
 The TPU `compile()` function reads these from the PrimFunc:
@@ -95,6 +157,7 @@ The TPU `compile()` function reads these from the PrimFunc:
 3. **ReLU**: `_detect_relu()` searches for `tir.Max` nodes
 4. **Dtype**: `_in_dtype_from_func()` reads first buffer's dtype → fp16 or bf16
 5. **Core count**: `_core_num_from_func()` finds `bz` For-node (kind=4) extent
+6. **Num stages**: `_num_stages_from_func()` reads `For.annotations["num_stages"]`
 
 All are overridable via explicit kwargs to `compile()` or `compile_gemm()`.
 
@@ -134,7 +197,7 @@ Profiling requires `BMLIB_ENABLE_ALL_PROFILE=1` set before device init.
 ## Compilation Output Structure
 
 ```
-/tmp/tilelang_tpu_<kernel>_<M>_<K>_<N>[_mc<cores>]/
+/tmp/tilelang_tpu_<kernel>_<M>_<K>_<N>[_mc<cores>][_nb<stages>]/
   tl_gemm_relu.pl                  # emitted PPL source
   lib/
     libkernel.so                   # device binary (loaded onto TPU)
@@ -157,5 +220,6 @@ Profiling requires `BMLIB_ENABLE_ALL_PROFILE=1` set before device init.
 5. **4D [1,M,1,N] layout** — PPL uses 4D shapes; the M and N dims are at positions
    1 and 3 (not 0 and 1)
 6. **Multi-core partitions M only** — N and K are not split across cores
-7. **No L2 cache optimization** — the reference `mlp_multicore.pl` uses L2
+7. **num_stages=2 only** — explicit double-buffer; triple-buffer (num_stages=3) not yet implemented
+8. **No L2 cache optimization** — the reference `mlp_multicore.pl` uses L2
    (`gtensor<fp16>(..., L2)`) for shared data; our template doesn't yet

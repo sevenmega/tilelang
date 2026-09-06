@@ -353,6 +353,222 @@ __TEST__ void {kernel_name}_main() {{
 """
 
 
+# Single-core double-buffer: explicit ping-pong with parallel_start/parallel_end.
+_PL_TEMPLATE_MULTIBUF = r"""#include "ppl.h"
+
+using namespace ppl;
+
+// Double-buffered C[M,N] = (relu?)(A[M,K] @ B[K,N]); explicit ping-pong buffers.
+__KERNEL__ void {kernel_name}({in_type} *ptr_res, {in_type} *ptr_left, {in_type} *ptr_right,
+                              int M, int K, int N) {{
+  const int block_m = {block_m};
+  const int block_k = {block_k};
+  const int block_n = {block_n};
+
+  dim4 res_global_shape   = {{1, M, 1, N}};
+  dim4 left_global_shape  = {{1, M, 1, K}};
+  dim4 right_global_shape = {{1, K, 1, N}};
+
+  auto res_gtensor   = gtensor<{in_type}>(res_global_shape,   GLOBAL, ptr_res);
+  auto left_gtensor  = gtensor<{in_type}>(left_global_shape,  GLOBAL, ptr_left);
+  auto right_gtensor = gtensor<{in_type}>(right_global_shape, GLOBAL, ptr_right);
+
+  dim4 res_max_shape   = {{1, block_m, 1, block_n}};
+  dim4 left_max_shape  = {{1, block_m, 1, block_k}};
+  dim4 right_max_shape = {{1, block_k, 1, block_n}};
+
+  auto sub_left_0  = tensor<{in_type}>(left_max_shape);
+  auto sub_left_1  = tensor<{in_type}>(left_max_shape);
+  auto sub_right_0 = tensor<{in_type}>(right_max_shape);
+  auto sub_right_1 = tensor<{in_type}>(right_max_shape);
+  auto res_{in_type}  = tensor<{in_type}>(res_max_shape, TPU_COMPACT);
+
+  for (int idx_m = 0; idx_m < M; idx_m += block_m) {{
+    for (int idx_n = 0; idx_n < N; idx_n += block_n) {{
+      auto sub_res = make_tensor<fp32>(res_max_shape, res_max_shape);
+      tiu::zero(sub_res);
+      int K_iters = K / block_k;
+      int bias = 0;
+      bool saturate = false;
+      float requant = 1;
+
+      // Prologue: load first tile pair into buffer 0
+      dma::load(sub_left_0,
+                left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, 0}}));
+      dma::load(sub_right_0,
+                right_gtensor.sub_view(right_max_shape, {{0, 0, 0, idx_n}}));
+
+      // Main loop: overlap load[i+1] with compute[i]
+      int ping = 0;
+      for (int ki = 0; ki < K_iters - 1; ki++) {{
+        int next_k = (ki + 1) * block_k;
+        parallel_start();
+        if (ping == 0) {{
+          dma::load(sub_left_1,
+                    left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, next_k}}));
+          dma::load(sub_right_1,
+                    right_gtensor.sub_view(right_max_shape, {{0, next_k, 0, idx_n}}));
+          tiu::fmm2_nn(sub_res, sub_left_0, sub_right_0, bias, true, DT_FP32,
+                       false, saturate, requant);
+        }} else {{
+          dma::load(sub_left_0,
+                    left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, next_k}}));
+          dma::load(sub_right_0,
+                    right_gtensor.sub_view(right_max_shape, {{0, next_k, 0, idx_n}}));
+          tiu::fmm2_nn(sub_res, sub_left_1, sub_right_1, bias, true, DT_FP32,
+                       false, saturate, requant);
+        }}
+        parallel_end();
+        ping = 1 - ping;
+      }}
+
+      // Epilogue: compute last iteration (relu only here)
+      if (ping == 0) {{
+        tiu::fmm2_nn(sub_res, sub_left_0, sub_right_0, bias, true, DT_FP32,
+                     {do_relu_int} != 0, saturate, requant);
+      }} else {{
+        tiu::fmm2_nn(sub_res, sub_left_1, sub_right_1, bias, true, DT_FP32,
+                     {do_relu_int} != 0, saturate, requant);
+      }}
+
+      tiu::cast(res_{in_type}, sub_res);
+      dim4 res_offset = {{0, idx_m, 0, idx_n}};
+      dma::store(res_gtensor.sub_view(res_max_shape, res_offset), res_{in_type});
+    }}
+  }}
+}}
+
+__TEST__ void {kernel_name}_main() {{
+  const int M = {M};
+  const int K = {K};
+  const int N = {N};
+  dim4 res_shape   = {{1, M, 1, N}};
+  dim4 left_shape  = {{1, M, 1, K}};
+  dim4 right_shape = {{1, K, 1, N}};
+  {in_type} *res   = malloc<{in_type}>(&res_shape);
+  rand(res, &res_shape, -1.0, 1.0);
+  {in_type} *left  = malloc<{in_type}>(&left_shape);
+  rand(left, &left_shape, -1.0, 1.0);
+  {in_type} *right = malloc<{in_type}>(&right_shape);
+  rand(right, &right_shape, -1.0, 1.0);
+  {kernel_name}(res, left, right, M, K, N);
+}}
+"""
+
+# Multi-core + double-buffer: M partitioned across cores, explicit ping-pong buffers.
+_PL_TEMPLATE_MULTICORE_MULTIBUF = r"""#include "ppl.h"
+
+using namespace ppl;
+
+// Multi-core double-buffered C[M,N] = (relu?)(A[M,K] @ B[K,N]).
+// M partitioned across cores; explicit ping-pong with parallel_start/parallel_end.
+__KERNEL__ void {kernel_name}({in_type} *ptr_res, {in_type} *ptr_left, {in_type} *ptr_right,
+                              int M, int K, int N) {{
+  set_block_num_max();
+  int core_num = get_block_num();
+  int core_idx = get_block_index();
+  if (core_idx >= core_num) return;
+
+  const int block_m = {block_m};
+  const int block_k = {block_k};
+  const int block_n = {block_n};
+
+  int M_tiles = (M + block_m - 1) / block_m;
+  int tiles_per_core = (M_tiles + core_num - 1) / core_num;
+  int m_start = core_idx * tiles_per_core * block_m;
+  int m_end   = min(m_start + tiles_per_core * block_m, M);
+
+  dim4 res_global_shape   = {{1, M, 1, N}};
+  dim4 left_global_shape  = {{1, M, 1, K}};
+  dim4 right_global_shape = {{1, K, 1, N}};
+
+  auto res_gtensor   = gtensor<{in_type}>(res_global_shape,   GLOBAL, ptr_res);
+  auto left_gtensor  = gtensor<{in_type}>(left_global_shape,  GLOBAL, ptr_left);
+  auto right_gtensor = gtensor<{in_type}>(right_global_shape, GLOBAL, ptr_right);
+
+  dim4 res_max_shape   = {{1, block_m, 1, block_n}};
+  dim4 left_max_shape  = {{1, block_m, 1, block_k}};
+  dim4 right_max_shape = {{1, block_k, 1, block_n}};
+
+  auto sub_left_0  = tensor<{in_type}>(left_max_shape);
+  auto sub_left_1  = tensor<{in_type}>(left_max_shape);
+  auto sub_right_0 = tensor<{in_type}>(right_max_shape);
+  auto sub_right_1 = tensor<{in_type}>(right_max_shape);
+  auto res_{in_type}  = tensor<{in_type}>(res_max_shape, TPU_COMPACT);
+
+  for (int idx_m = m_start; idx_m < m_end; idx_m += block_m) {{
+    for (int idx_n = 0; idx_n < N; idx_n += block_n) {{
+      auto sub_res = make_tensor<fp32>(res_max_shape, res_max_shape);
+      tiu::zero(sub_res);
+      int K_iters = K / block_k;
+      int bias = 0;
+      bool saturate = false;
+      float requant = 1;
+
+      // Prologue: load first tile pair into buffer 0
+      dma::load(sub_left_0,
+                left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, 0}}));
+      dma::load(sub_right_0,
+                right_gtensor.sub_view(right_max_shape, {{0, 0, 0, idx_n}}));
+
+      // Main loop: overlap load[i+1] with compute[i]
+      int ping = 0;
+      for (int ki = 0; ki < K_iters - 1; ki++) {{
+        int next_k = (ki + 1) * block_k;
+        parallel_start();
+        if (ping == 0) {{
+          dma::load(sub_left_1,
+                    left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, next_k}}));
+          dma::load(sub_right_1,
+                    right_gtensor.sub_view(right_max_shape, {{0, next_k, 0, idx_n}}));
+          tiu::fmm2_nn(sub_res, sub_left_0, sub_right_0, bias, true, DT_FP32,
+                       false, saturate, requant);
+        }} else {{
+          dma::load(sub_left_0,
+                    left_gtensor.sub_view(left_max_shape, {{0, idx_m, 0, next_k}}));
+          dma::load(sub_right_0,
+                    right_gtensor.sub_view(right_max_shape, {{0, next_k, 0, idx_n}}));
+          tiu::fmm2_nn(sub_res, sub_left_1, sub_right_1, bias, true, DT_FP32,
+                       false, saturate, requant);
+        }}
+        parallel_end();
+        ping = 1 - ping;
+      }}
+
+      // Epilogue: compute last iteration (relu only here)
+      if (ping == 0) {{
+        tiu::fmm2_nn(sub_res, sub_left_0, sub_right_0, bias, true, DT_FP32,
+                     {do_relu_int} != 0, saturate, requant);
+      }} else {{
+        tiu::fmm2_nn(sub_res, sub_left_1, sub_right_1, bias, true, DT_FP32,
+                     {do_relu_int} != 0, saturate, requant);
+      }}
+
+      tiu::cast(res_{in_type}, sub_res);
+      dim4 res_offset = {{0, idx_m, 0, idx_n}};
+      dma::store(res_gtensor.sub_view(res_max_shape, res_offset), res_{in_type});
+    }}
+  }}
+}}
+
+__TEST__ void {kernel_name}_main() {{
+  const int M = {M};
+  const int K = {K};
+  const int N = {N};
+  dim4 res_shape   = {{1, M, 1, N}};
+  dim4 left_shape  = {{1, M, 1, K}};
+  dim4 right_shape = {{1, K, 1, N}};
+  {in_type} *res   = malloc<{in_type}>(&res_shape);
+  rand(res, &res_shape, -1.0, 1.0);
+  {in_type} *left  = malloc<{in_type}>(&left_shape);
+  rand(left, &left_shape, -1.0, 1.0);
+  {in_type} *right = malloc<{in_type}>(&right_shape);
+  rand(right, &right_shape, -1.0, 1.0);
+  {kernel_name}(res, left, right, M, K, N);
+}}
+"""
+
+
 # The ctypes wrapper .cpp.  Built as lib<kernel>_py.so; loaded from Python.
 # Mirrors test_tl_gemm_relu/tl_py_wrapper.cpp (hardware-verified).
 _WRAPPER_TEMPLATE = r"""// ctypes-callable wrapper around the generated {kernel_name} kernel launch.
@@ -439,6 +655,7 @@ class PPLGemmSpec:
     relu: bool = True
     in_dtype: str = "fp16"  # "fp16" (verified) or "bf16" (wild-guess, correctness N/A)
     core_num: int = 1       # 1 = single-core, >1 = multi-core (SG2260E has 4)
+    num_stages: int = 1     # 1 = single-buffer, 2 = double-buffer (explicit ping-pong)
     kernel_name: str = "tl_gemm_relu"
 
     def __post_init__(self) -> None:
@@ -462,7 +679,10 @@ class PPLGemmSpec:
 
 
 def emit_pl(spec: PPLGemmSpec) -> str:
-    template = _PL_TEMPLATE_MULTICORE if spec.core_num > 1 else _PL_TEMPLATE
+    if spec.num_stages >= 2:
+        template = _PL_TEMPLATE_MULTICORE_MULTIBUF if spec.core_num > 1 else _PL_TEMPLATE_MULTIBUF
+    else:
+        template = _PL_TEMPLATE_MULTICORE if spec.core_num > 1 else _PL_TEMPLATE
     return template.format(
         kernel_name=spec.kernel_name,
         in_type=spec.in_dtype,

@@ -1,0 +1,314 @@
+Loading tilelang libs from dev root: /workspace/tilelang/build
+==============================================================================================================================================================================================
+Summary
+==============================================================================================================================================================================================
+ CoreId | Parallelism(%) |  totalTime(us) | TiuWorkingRatio |  totalTiuCycle | uArchURate |   totalGdmaCycle | GdmaDdrAvgBW(GB/s) |  GdmaL2AvgBW(GB/s) |   totalSdmaCycle | SdmaDdrAvgBW(GB/s)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      0 |        107.18% |       1695.676 |           9.05% |         153408 |    100.00% |          1664078 |              10.40 |               0.00 |                0 |               0.00
+      1 |        107.20% |       1695.676 |           9.05% |         153408 |    100.00% |          1664324 |              10.40 |               0.00 |                0 |               0.00
+      2 |        107.50% |       1695.676 |           9.05% |         153408 |    100.00% |          1669452 |              10.36 |               0.00 |                0 |               0.00
+      3 |        107.43% |       1695.676 |           9.05% |         153408 |    100.00% |          1668252 |              10.37 |               0.00 |                0 |               0.00
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Overall |        107.33% |       1695.676 |           9.05% |    153.408(us) |    100.00% |     1669.452(us) |              10.38 |               0.00 |        0.000(us) |               0.00
+==============================================================================================================================================================================================
+
+============================================================
+  Overall kernel time: 1695.68 us
+  Profiling data:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_1024_1024
+  Raw cdm files:       /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_1024_1024/cdm_profile_data_dev4-0
+  Perfetto trace:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_1024_1024/out_0/perfetto.pftrace
+  Open in Perfetto UI: https://ui.perfetto.dev/
+============================================================
+==============================================================================================================================================================================================
+Summary
+==============================================================================================================================================================================================
+ CoreId | Parallelism(%) |  totalTime(us) | TiuWorkingRatio |  totalTiuCycle | uArchURate |   totalGdmaCycle | GdmaDdrAvgBW(GB/s) |  GdmaL2AvgBW(GB/s) |   totalSdmaCycle | SdmaDdrAvgBW(GB/s)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      0 |        108.81% |      12412.409 |           9.83% |        1219840 |    100.00% |         12285570 |              11.10 |               0.00 |                0 |               0.00
+      1 |        108.67% |      12412.409 |           9.83% |        1219840 |    100.00% |         12268522 |              11.11 |               0.00 |                0 |               0.00
+      2 |        108.84% |      12412.409 |           9.83% |        1219840 |    100.00% |         12289398 |              11.09 |               0.00 |                0 |               0.00
+      3 |        108.97% |      12412.409 |           9.83% |        1219840 |    100.00% |         12306165 |              11.08 |               0.00 |                0 |               0.00
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Overall |        108.82% |      12412.409 |           9.83% |   1219.840(us) |    100.00% |    12306.165(us) |              11.09 |               0.00 |        0.000(us) |               0.00
+==============================================================================================================================================================================================
+
+============================================================
+  Overall kernel time: 12412.41 us
+  Profiling data:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_2048_2048_2048
+  Raw cdm files:       /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_2048_2048_2048/cdm_profile_data_dev4-0
+  Perfetto trace:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_2048_2048_2048/out_0/perfetto.pftrace
+  Open in Perfetto UI: https://ui.perfetto.dev/
+============================================================
+==============================================================================================================================================================================================
+Summary
+==============================================================================================================================================================================================
+ CoreId | Parallelism(%) |  totalTime(us) | TiuWorkingRatio |  totalTiuCycle | uArchURate |   totalGdmaCycle | GdmaDdrAvgBW(GB/s) |  GdmaL2AvgBW(GB/s) |   totalSdmaCycle | SdmaDdrAvgBW(GB/s)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      0 |        104.33% |        853.147 |           8.99% |          76704 |    100.00% |           813417 |              10.64 |               0.00 |                0 |               0.00
+      1 |        104.56% |        853.147 |           8.99% |          76704 |    100.00% |           815338 |              10.61 |               0.00 |                0 |               0.00
+      2 |        105.13% |        853.147 |           8.99% |          76704 |    100.00% |           820188 |              10.55 |               0.00 |                0 |               0.00
+      3 |        105.31% |        853.147 |           8.99% |          76704 |    100.00% |           821737 |              10.53 |               0.00 |                0 |               0.00
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Overall |        104.83% |        853.147 |           8.99% |     76.704(us) |    100.00% |      821.737(us) |              10.58 |               0.00 |        0.000(us) |               0.00
+==============================================================================================================================================================================================
+
+============================================================
+  Overall kernel time: 853.15 us
+  Profiling data:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_512_1024
+  Raw cdm files:       /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_512_1024/cdm_profile_data_dev4-0
+  Perfetto trace:      /tmp/tilelang_tpu_tl_gemm_relu_1024_1024_1024_mc4/profiling_1024_512_1024/out_0/perfetto.pftrace
+  Open in Perfetto UI: https://ui.perfetto.dev/
+============================================================
+TIR:
+2026-09-06 11:17:56  [TileLang:tilelang.jit:WARNING] (__init__.py:364): [TPU]: JITImpl->get_tir(), set target to tpu
+2026-09-06 11:17:56  [TileLang:tilelang.language.kernel:WARNING] (kernel.py:364): [TPU]: Kernel(), target is tpu
+# from tvm.script import tirx as T
+
+@T.prim_func
+def matmul_multicore(A: T.handle, B: T.handle, C_handle: T.handle):
+    T.func_attr({"tilelang_out_idx": [-1]})
+    A_1 = T.match_buffer(A, (1024, 1024), "float16", strides=(1024, 1))
+    B_1 = T.match_buffer(B, (1024, 1024), "float16", strides=(1024, 1))
+    C = T.match_buffer(C_handle, (1024, 1024), "float16", strides=(1024, 1))
+    # with T.sblock("root"):
+    for bx in T.thread_binding(16, thread="blockIdx.x"):
+        for by in T.thread_binding(4, thread="blockIdx.y"):
+            for bz in T.thread_binding(4, thread="blockIdx.z"):
+                with T.sblock("tilelang_root"):
+                    T.reads()
+                    T.writes()
+                    T.sblock_attr({"is_tpu_kernel_frame": True})
+                    A_local = T.sblock_alloc_buffer((64, 32), "float16", scope="local")
+                    B_local = T.sblock_alloc_buffer((32, 64), "float16", scope="local")
+                    C_local = T.sblock_alloc_buffer((64, 64), scope="local")
+                    by_global: T.int32 = bz * 4 + by
+                    if by_global * 64 < 1024:
+                        T.fill(T.region(C_local[0, 0], 2, 64, 64), 0)
+                        for k in range(32):
+                            T.copy(T.region(A_1[by_global * 64, k * 32], 1, 64, 32), T.region(A_local[0, 0], 2, 64, 32))
+                            T.copy(T.region(B_1[k * 32, bx * 64], 1, 32, 64), T.region(B_local[0, 0], 2, 32, 64))
+                            T.gemm(T.region(A_local[0, 0], 1, 64, 32), T.region(B_local[0, 0], 1, 32, 64), T.region(C_local[0, 0], 3, 64, 64), T.bool(False), T.bool(False), 64, 64, 32, 0, T.bool(False), 32, 64, 0, 0, 1, 0, 0, 0, 0)
+                        for i in T.parallel(64):
+                            for j in T.parallel(64):
+                                C_local[i, j] = T.max(C_local[i, j], T.float32(0.0))
+                        T.copy(T.region(C_local[0, 0], 1, 64, 64), T.region(C[by_global * 64, bx * 64], 2, 64, 64))
+2026-09-06 11:17:56  [TileLang:tilelang.jit:WARNING] (__init__.py:448): [TPU]: JITImpl->compile
+2026-09-06 11:17:56  [TileLang:tilelang.jit:WARNING] (__init__.py:364): [TPU]: JITImpl->get_tir(), set target to tpu
+2026-09-06 11:17:56  [TileLang:tilelang.language.kernel:WARNING] (kernel.py:364): [TPU]: Kernel(), target is tpu
+2026-09-06 11:17:56  [TileLang:tilelang.jit:WARNING] (__init__.py:450): [TPU]: JITImpl->compile, after get_tir, calling compile()
+2026-09-06 11:17:56  [TileLang:tilelang.jit.kernel:WARNING] (kernel.py:102): [TPU]: JITKernel->__init__
+2026-09-06 11:17:56  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:132): TileLang begins to compile kernel `matmul_multicore` with `out_idx=[-1]`
+2026-09-06 11:17:56  [TileLang:tilelang.jit.kernel:WARNING] (kernel.py:222): [TPU]: JITKernel->_compile_and_create_adapter
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.compiler:WARNING] (compiler.py:437): [TPU]: tpu_compiler()
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.compiler:WARNING] (compiler.py:216): [TPU]: compile_gemm()
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:766): [TPU]: ppl_runner->build()
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:783): [TPU]: ppl_runner->build() cache HIT, skipping compilation
+2026-09-06 11:17:56  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:140): TileLang completes to compile kernel `matmul_multicore`
+
+Multi-core (core_num=4) GEMM+ReLU compilation succeeded.
+
+Generated PPL kernel source:
+#include "ppl.h"
+
+using namespace ppl;
+
+// Multi-core C[M,N] = (relu?)(A[M,K] @ B[K,N]); M partitioned across cores.
+__KERNEL__ void tl_gemm_relu(fp16 *ptr_res, fp16 *ptr_left, fp16 *ptr_right,
+                              int M, int K, int N) {
+  set_block_num_max();
+  int core_num = get_block_num();
+  int core_idx = get_block_index();
+  if (core_idx >= core_num) return;
+
+  const int block_m = 64;
+  const int block_k = 32;
+  const int block_n = 64;
+
+  int M_tiles = (M + block_m - 1) / block_m;
+  int tiles_per_core = (M_tiles + core_num - 1) / core_num;
+  int m_start = core_idx * tiles_per_core * block_m;
+  int m_end   = min(m_start + tiles_per_core * block_m, M);
+
+  dim4 res_global_shape   = {1, M, 1, N};
+  dim4 left_global_shape  = {1, M, 1, K};
+  dim4 right_global_shape = {1, K, 1, N};
+
+  auto res_gtensor   = gtensor<fp16>(res_global_shape,   GLOBAL, ptr_res);
+  auto left_gtensor  = gtensor<fp16>(left_global_shape,  GLOBAL, ptr_left);
+  auto right_gtensor = gtensor<fp16>(right_global_shape, GLOBAL, ptr_right);
+
+  dim4 res_max_shape   = {1, block_m, 1, block_n};
+  dim4 left_max_shape  = {1, block_m, 1, block_k};
+  dim4 right_max_shape = {1, block_k, 1, block_n};
+
+  auto sub_left  = tensor<fp16>(left_max_shape);
+  auto sub_right = tensor<fp16>(right_max_shape);
+  auto res_fp16  = tensor<fp16>(res_max_shape, TPU_COMPACT);
+
+  for (int idx_m = m_start; idx_m < m_end; idx_m += block_m) {
+    for (int idx_n = 0; idx_n < N; idx_n += block_n) {
+      auto sub_res = make_tensor<fp32>(res_max_shape, res_max_shape);
+      tiu::zero(sub_res);
+      for (int idx_k = 0; idx_k < K; idx_k += block_k) {
+        enable_pipeline();
+        dim4 left_offset  = {0, idx_m, 0, idx_k};
+        dim4 right_offset = {0, idx_k, 0, idx_n};
+        dma::load(sub_left,
+                  left_gtensor.sub_view(left_max_shape, left_offset));
+        dma::load(sub_right,
+                  right_gtensor.sub_view(right_max_shape, right_offset));
+        bool last_k = (K - idx_k <= block_k);
+        int bias = 0;
+        bool saturate = false;
+        float requant = 1;
+        tiu::fmm2_nn(sub_res, sub_left, sub_right, bias, /*result_add=*/true,
+                     DT_FP32, /*do_relu=*/(1 && last_k), saturate, requant);
+      }
+      tiu::cast(res_fp16, sub_res);
+      dim4 res_offset = {0, idx_m, 0, idx_n};
+      dma::store(res_gtensor.sub_view(res_max_shape, res_offset), res_fp16);
+    }
+  }
+}
+
+__TEST__ void tl_gemm_relu_main() {
+  const int M = 1024;
+  const int K = 1024;
+  const int N = 1024;
+  dim4 res_shape   = {1, M, 1, N};
+  dim4 left_shape  = {1, M, 1, K};
+  dim4 right_shape = {1, K, 1, N};
+  fp16 *res   = malloc<fp16>(&res_shape);
+  rand(res, &res_shape, -1.0, 1.0);
+  fp16 *left  = malloc<fp16>(&left_shape);
+  rand(left, &left_shape, -1.0, 1.0);
+  fp16 *right = malloc<fp16>(&right_shape);
+  rand(right, &right_shape, -1.0, 1.0);
+  tl_gemm_relu(res, left, right, M, K, N);
+}
+
+
+--- Testing M=1024, N=1024, K=1024 (core_num=4) ---
+2026-09-06 11:17:56  [TileLang:tilelang.jit.kernel:WARNING] (kernel.py:205): [TPU]: JITKernel->__call__
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1066): [TPU]: PPLKernel->__init__
+<class 'ctypes.CDLL.__init__.<locals>._FuncPtr'>
+2026-09-06 11:17:56  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1168): [TPU]: PPLKernel->run()
+PASS: TPU result matches torch reference
+
+--- Profiling M=1024, N=1024, K=1024 ---
+
+--- Testing M=2048, N=2048, K=2048 (core_num=4) ---
+2026-09-06 11:18:02  [TileLang:tilelang.jit.kernel:WARNING] (kernel.py:205): [TPU]: JITKernel->__call__
+2026-09-06 11:18:02  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1066): [TPU]: PPLKernel->__init__
+<class 'ctypes.CDLL.__init__.<locals>._FuncPtr'>
+2026-09-06 11:18:02  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1168): [TPU]: PPLKernel->run()
+PASS: TPU result matches torch reference
+
+--- Profiling M=2048, N=2048, K=2048 ---
+
+--- Testing M=1024, N=512, K=1024 (core_num=4) ---
+2026-09-06 11:18:36  [TileLang:tilelang.jit.kernel:WARNING] (kernel.py:205): [TPU]: JITKernel->__call__
+2026-09-06 11:18:36  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1066): [TPU]: PPLKernel->__init__
+<class 'ctypes.CDLL.__init__.<locals>._FuncPtr'>
+2026-09-06 11:18:36  [TileLang:tilelang.tpu.ppl_runner:WARNING] (ppl_runner.py:1168): [TPU]: PPLKernel->run()
+PASS: TPU result matches torch reference
+
+--- Profiling M=1024, N=512, K=1024 ---
+
+All multi-core tests passed (core_num=4).
+=== this program is under PROFILE mode, which will cost extra time ===
+=========== [profile] Device 4 =========== 
+Port 0:
+  pmu_CDMA record 2
+Port 6:
+  pmu_CDMA record 2
+Port 2:
+  pmu_CDMA record 2
+Core 0:
+  pmu_TIU record 2184
+  pmu_GDMA record 4168
+  pmu_SDMA record 8
+  Condensed pio cmd record 6360
+  des cmd record 0
+Core 1:
+  pmu_TIU record 2184
+  pmu_GDMA record 4168
+  pmu_SDMA record 8
+  Condensed pio cmd record 6360
+  des cmd record 0
+Core 2:
+  pmu_TIU record 2184
+  pmu_GDMA record 4168
+  pmu_SDMA record 8
+  Condensed pio cmd record 6360
+  des cmd record 0
+Core 3:
+  pmu_TIU record 2184
+  pmu_GDMA record 4168
+  pmu_SDMA record 8
+  Condensed pio cmd record 6369
+  des cmd record 0
+=== this program is under PROFILE mode, which will cost extra time ===
+=========== [profile] Device 4 =========== 
+Port 0:
+  pmu_CDMA record 2
+Port 6:
+  pmu_CDMA record 2
+Port 2:
+  pmu_CDMA record 2
+Core 0:
+  pmu_TIU record 16904
+  pmu_GDMA record 33032
+  pmu_SDMA record 8
+  Condensed pio cmd record 49944
+  des cmd record 0
+Core 1:
+  pmu_TIU record 16904
+  pmu_GDMA record 33032
+  pmu_SDMA record 8
+  Condensed pio cmd record 49944
+  des cmd record 0
+Core 2:
+  pmu_TIU record 16904
+  pmu_GDMA record 33032
+  pmu_SDMA record 8
+  Condensed pio cmd record 49944
+  des cmd record 0
+Core 3:
+  pmu_TIU record 16904
+  pmu_GDMA record 33032
+  pmu_SDMA record 8
+  Condensed pio cmd record 49953
+  des cmd record 0
+=== this program is under PROFILE mode, which will cost extra time ===
+=========== [profile] Device 4 =========== 
+Port 0:
+  pmu_CDMA record 2
+Port 6:
+  pmu_CDMA record 2
+Port 2:
+  pmu_CDMA record 2
+Core 0:
+  pmu_TIU record 1096
+  pmu_GDMA record 2088
+  pmu_SDMA record 8
+  Condensed pio cmd record 3192
+  des cmd record 0
+Core 1:
+  pmu_TIU record 1096
+  pmu_GDMA record 2088
+  pmu_SDMA record 8
+  Condensed pio cmd record 3192
+  des cmd record 0
+Core 2:
+  pmu_TIU record 1096
+  pmu_GDMA record 2088
+  pmu_SDMA record 8
+  Condensed pio cmd record 3192
+  des cmd record 0
+Core 3:
+  pmu_TIU record 1096
+  pmu_GDMA record 2088
+  pmu_SDMA record 8
+  Condensed pio cmd record 3201
+  des cmd record 0

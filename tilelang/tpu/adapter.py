@@ -26,13 +26,57 @@ class PPLKernelAdapter:
     ):
         self._tpu_kernel = tpu_kernel
         self.params = params
-        self.result_idx = result_idx
+        self.result_idx = self._legalize_result_idx(result_idx)
         self.func = self._call
 
+    def _legalize_result_idx(self, result_idx: list[int]) -> list[int]:
+        n = len(self.params)
+        if n == 0:
+            return result_idx
+        return [i % n for i in result_idx]
+
     def _call(self, *args: Any) -> Any:
-        if len(args) >= 2:
-            return self._tpu_kernel(args[0], args[1])
-        raise ValueError("PPL GEMM kernel expects at least 2 tensor arguments (A, B)")
+        n_params = len(self.params)
+        n_outputs = len(self.result_idx)
+        n_inputs = n_params - n_outputs
+
+        if len(args) == n_inputs:
+            # Auto-allocate mode: kernel(a, b) — only inputs provided.
+            # Run the kernel and return the result.
+            inputs: list[Any] = []
+            ins_idx = 0
+            for i in range(n_params):
+                if i not in self.result_idx:
+                    inputs.append(args[ins_idx])
+                    ins_idx += 1
+            if len(inputs) < 2:
+                raise ValueError("PPL GEMM kernel expects at least 2 tensor inputs (A, B)")
+            return self._tpu_kernel(inputs[0], inputs[1])
+
+        if len(args) == n_params:
+            # Write-into mode: kernel(a, b, c) — all params including
+            # pre-allocated output tensor(s).  Run the kernel with the
+            # input tensors, then copy the result into the caller's
+            # output tensor (handles dtype conversion via copy_()).
+            inputs = []
+            outputs = []
+            for i in range(n_params):
+                if i in self.result_idx:
+                    outputs.append(args[i])
+                else:
+                    inputs.append(args[i])
+            if len(inputs) < 2:
+                raise ValueError("PPL GEMM kernel expects at least 2 tensor inputs (A, B)")
+            result = self._tpu_kernel(inputs[0], inputs[1])
+            for out in outputs:
+                out.copy_(result)
+            return None
+
+        raise ValueError(
+            f"PPL kernel accepts {n_inputs} inputs (auto-allocate output) "
+            f"or {n_params} args (write into pre-allocated output), "
+            f"but {len(args)} were provided."
+        )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.func(*args, **kwargs)

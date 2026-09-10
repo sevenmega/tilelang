@@ -99,7 +99,13 @@ class TPUKernel:
         a = a.detach().cpu().contiguous()
         b = b.detach().cpu().contiguous()
         self._a, self._b = a, b
-        return self._ensure_runtime().run(a, b)
+        try:
+            return self._ensure_runtime().run(a, b)
+        except (RuntimeError, OSError):
+            # Device handle may be stale (e.g. invalidated by another
+            # config's py_init_device during autotuning).  Reinitialize.
+            self.close()
+            return self._ensure_runtime().run(a, b)
 
     def enable_profile(
         self,

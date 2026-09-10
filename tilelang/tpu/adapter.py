@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
 from tilelang.engine.param import KernelParam
 from tilelang.tpu.compiler import TPUKernel
 
@@ -42,7 +43,7 @@ class PPLKernelAdapter:
 
         if len(args) == n_inputs:
             # Auto-allocate mode: kernel(a, b) — only inputs provided.
-            # Run the kernel and return the result.
+            # Run the kernel and return the result, cast to declared dtype.
             inputs: list[Any] = []
             ins_idx = 0
             for i in range(n_params):
@@ -51,7 +52,12 @@ class PPLKernelAdapter:
                     ins_idx += 1
             if len(inputs) < 2:
                 raise ValueError("PPL GEMM kernel expects at least 2 tensor inputs (A, B)")
-            return self._tpu_kernel(inputs[0], inputs[1])
+            result = self._tpu_kernel(inputs[0], inputs[1])
+            if self.result_idx:
+                declared_dtype = self.params[self.result_idx[0]].torch_dtype()
+                if result.dtype != declared_dtype:
+                    result = result.to(declared_dtype)
+            return result
 
         if len(args) == n_params:
             # Write-into mode: kernel(a, b, c) — all params including
@@ -95,6 +101,9 @@ class PPLKernelAdapter:
 
     def get_profiler(self, **kwargs: Any):
         return self._tpu_kernel.get_profiler(**kwargs)
+
+    def close(self):
+        self._tpu_kernel.close()
 
     def get_exportable_executable(self):
         raise NotImplementedError("PPL backend does not support TVM module export")

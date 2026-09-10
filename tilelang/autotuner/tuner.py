@@ -41,6 +41,20 @@ from tilelang import __version__
 
 TargetLike = str | dict[str, object] | Target
 
+
+def _default_bench_backend_for_target(target: TargetLike) -> Literal["event", "wallclock"]:
+    """Return the default profiler backend for a compilation target.
+
+    TPU uses wall-clock timing because the kernel call is fully synchronous
+    (H2D, launch, sync, D2H) and CUDA events are unavailable.  All other
+    targets default to CUDA-event timing.
+    """
+    target_str = str(target).lower()
+    if "tpu" in target_str:
+        return "wallclock"
+    return "event"
+
+
 ConfigArg = dict[str, Any]
 UnitItem = tuple[int, ConfigArg]
 UnitResult = tuple[int, ConfigArg, tilelang.JITKernel | None, Exception | None]
@@ -358,7 +372,7 @@ class AutoTuner:
         skip_check: bool = False,
         manual_check_prog: Callable = None,
         cache_input_tensors: bool = False,
-        backend: Literal["event", "cupti", "cudagraph"] = "event",
+        backend: Literal["event", "cupti", "cudagraph", "wallclock"] = "event",
     ):
         """Set profiling arguments for the auto-tuner.
 
@@ -1285,6 +1299,13 @@ class AutoTuner:
             ref_latency=ref_latency,
         )
 
+        # Reset device-level runtime state so the next call gets a fresh
+        # handle.  On TPU, each config's py_init_device() may invalidate
+        # handles from earlier configs, leaving the best kernel's handle
+        # stale.  A close()+lazy-reinit on next call fixes this.
+        if hasattr(best_kernel.adapter, "close"):
+            best_kernel.adapter.close()
+
         autotuner_result = AutotuneResult(
             latency=best_latency,
             config=best_config,
@@ -1372,6 +1393,9 @@ class AutoTuneImpl(Generic[_P, _T]):
         return jit_compile
 
     def get_tunner(self):
+        # Resolve the benchmark backend from the compilation target.
+        # TPU needs wall-clock timing; CUDA targets use CUDA events.
+        bench_backend = _default_bench_backend_for_target(self.jit_impl.target)
         autotuner = (
             AutoTuner(self.jit_impl.func, configs=self.configs)
             .set_profile_args(
@@ -1384,6 +1408,7 @@ class AutoTuneImpl(Generic[_P, _T]):
                 skip_check=self.skip_check,
                 manual_check_prog=self.manual_check_prog,
                 cache_input_tensors=self.cache_input_tensors,
+                backend=bench_backend,
             )
             .set_compile_args(
                 out_idx=self.jit_impl.out_idx,

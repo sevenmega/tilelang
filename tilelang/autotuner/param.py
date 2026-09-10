@@ -115,7 +115,7 @@ class ProfileArgs:
     warmup: int = 25
     rep: int = 100
     timeout: int = 30
-    backend: Literal["event", "cupti", "cudagraph"] = "event"
+    backend: Literal["event", "cupti", "cudagraph", "wallclock"] = "event"
     supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto
     ref_prog: Callable = None
     supply_prog: Callable = None

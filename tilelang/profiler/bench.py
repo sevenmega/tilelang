@@ -73,7 +73,7 @@ def do_bench(
     _n_repeat: int = 0,
     quantiles: list[float] | None = None,
     fast_flush: bool = True,
-    backend: Literal["event", "cupti", "cudagraph"] = "event",
+    backend: Literal["event", "cupti", "cudagraph", "wallclock"] = "event",
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
     device: int | torch.device | None = None,
     cache_size: int = 256,
@@ -106,6 +106,16 @@ def do_bench(
         Runtime in milliseconds (float) or list of quantile values if quantiles specified
     """
     assert return_mode in ["min", "max", "mean", "median"], f"Invalid return_mode: {return_mode}"
+
+    if backend == "wallclock":
+        return _bench_with_wallclock(
+            fn,
+            n_warmup=_n_warmup,
+            n_repeat=_n_repeat,
+            quantiles=quantiles,
+            return_mode=return_mode,
+            early_stop_baseline=early_stop_baseline,
+        )
 
     device_idx = _normalize_cuda_device(device)
     if device_idx is not None:
@@ -368,3 +378,53 @@ def _bench_with_cudagraph(
 
         # Return aggregated result
         return getattr(torch, return_mode)(times).item()
+
+
+def _bench_with_wallclock(
+    fn: Callable,
+    n_warmup: int,
+    n_repeat: int,
+    quantiles: list[float] | None,
+    return_mode: str,
+    early_stop_baseline: float | None = None,
+) -> float | list[float]:
+    """Benchmark using wall-clock timing (no GPU required).
+
+    Iteration counts are always auto-calculated from a time estimate to
+    keep total wall-clock time reasonable.  Callers tuned for CUDA often
+    pass ``n_warmup``/``n_repeat`` in the tens or hundreds — fine when each
+    CUDA kernel call costs microseconds, but catastrophic for backends
+    where a single call takes seconds (e.g., TPU with H2D/D2H transfers).
+    """
+    import time
+
+    fn()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        fn()
+    estimate_ms = (time.perf_counter() - t0) / 5 * 1e3
+
+    if early_stop_baseline is not None and estimate_ms > early_stop_baseline:
+        if quantiles is not None:
+            return [estimate_ms] * len(quantiles)
+        return estimate_ms
+
+    n_warmup = max(1, int(25 / max(estimate_ms, 1e-6)))
+    n_repeat = max(2, int(100 / max(estimate_ms, 1e-6)))
+
+    for _ in range(n_warmup):
+        fn()
+
+    times_list = []
+    for _ in range(n_repeat):
+        t0 = time.perf_counter()
+        fn()
+        times_list.append((time.perf_counter() - t0) * 1e3)
+
+    times = torch.tensor(times_list, dtype=torch.float)
+
+    if quantiles is not None:
+        quantile_values = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
+        return quantile_values[0] if len(quantile_values) == 1 else quantile_values
+
+    return getattr(torch, return_mode)(times).item()

@@ -35,7 +35,15 @@ from typing import Any
 import torch
 import logging
 
+from tilelang.tpu.ppl_codegen import translate, PPLKernelInfo, BufArg  # noqa: F401
+
 logger = logging.getLogger(__name__)
+
+_TORCH_DTYPE = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -627,7 +635,6 @@ int py_disable_profile(void *h) {{
 }}  // extern "C"
 """
 
-
 # Fragment appended to the --gen_test CMakeLists.txt to build the wrapper .so.
 # (Same shape as the tl_py target appended in test_tl_gemm_relu/CMakeLists.txt.)
 def _wrapper_cmake_fragment(kernel_name: str, wrapper_src: str) -> str:
@@ -678,7 +685,25 @@ class PPLGemmSpec:
 # --------------------------------------------------------------------------- #
 
 
-def emit_pl(spec: PPLGemmSpec) -> str:
+def emit_pl(func: Any) -> "PPLKernelInfo":
+    """Translate a lowered tilelang PrimFunc into a PPL kernel (generic path).
+
+    This is the single generic codegen entry point: it walks the lowered TIR
+    op-by-op (``tl.tileop.copy/fill/gemm/reduce`` + ``T.Parallel`` elementwise
+    bodies) and emits PPL -- no per-family template.  Returns a
+    :class:`~tilelang.tpu.ppl_codegen.PPLKernelInfo` carrying the ``.pl`` source
+    and the ordered pointer-argument metadata the runtime binds against.
+    """
+    return translate(func)
+
+
+def _emit_gemm_template(spec: PPLGemmSpec) -> str:
+    """Render the legacy hand-written GEMM(+ReLU) PPL template (int-arg kernel).
+
+    Retained for ``compile_gemm`` / ``run_profiling`` (runtime-int-shape,
+    multi-core, multi-buffer variants that the generic translator does not
+    model).  The generic ``.compile()`` path uses :func:`emit_pl` instead.
+    """
     if spec.num_stages >= 2:
         template = _PL_TEMPLATE_MULTICORE_MULTIBUF if spec.core_num > 1 else _PL_TEMPLATE_MULTIBUF
     else:
@@ -738,40 +763,97 @@ def _build_via_ppl_compile_py(
     subprocess.run(cmd, check=True, cwd=workdir)
 
 
-def build(
-    spec: PPLGemmSpec,
+def _generic_wrapper_src(kernel_name: str, num_args: int) -> str:
+    """Build a ctypes wrapper .cpp for a translator-generated kernel.
+
+    The generic ``__KERNEL__`` takes exactly ``num_args`` pointer arguments (in
+    PrimFunc param order; shapes are baked at compile time).  The launch entry
+    ``py_<kernel>`` therefore forwards a handle + ``num_args`` device addresses.
+    Device-management helpers are identical to the GEMM ``_WRAPPER_TEMPLATE``.
+    """
+    ptr_params = ", ".join(f"unsigned long long a{i}" for i in range(num_args))
+    ptr_args = ", ".join(f"a{i}" for i in range(num_args))
+    launch = (
+        f"int py_{kernel_name}(void *h, {ptr_params}) {{\n"
+        f"  return {kernel_name}((tpudnnHandle_t)h, {ptr_args});\n"
+        f"}}\n"
+    )
+    return f"""// ctypes-callable wrapper around the generated {kernel_name} kernel launch.
+#include "{kernel_name}.h"
+#include <tpuv7_rt.h>
+#include <tpuDNN.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static tpuRtStream_t g_stream = nullptr;
+static tpuRtKernelModule_t g_module = nullptr;
+
+extern "C" {{
+
+void *py_init_device(int devid) {{
+  if (tpuRtInit() != tpuRtSuccess) {{ fprintf(stderr, "tpuRtInit failed\\n"); return nullptr; }}
+  tpuRtSetDevice(devid);
+  tpuRtStreamCreate(&g_stream);
+  const char *kp = getenv("PPL_KERNEL_PATH");
+  if (!kp) {{ fprintf(stderr, "PPL_KERNEL_PATH not set\\n"); return nullptr; }}
+  g_module = tpuRtKernelLoadModuleFile(kp, g_stream);
+  if (!g_module) {{ fprintf(stderr, "tpuRtKernelLoadModuleFile failed for %s\\n", kp); return nullptr; }}
+  return (void *)tpudnnHandleFromStream(devid, g_stream, g_module);
+}}
+
+void py_release_device(void *h) {{
+  if (h) tpudnnDestroy((tpudnnHandle_t)h);
+  if (g_module) tpuRtKernelUnloadModule(g_module, g_stream);
+  if (g_stream) {{ tpuRtStreamSynchronize(g_stream); tpuRtStreamDestroy(g_stream); g_stream = nullptr; }}
+}}
+
+void py_sync_device(void *h) {{ if (h) tpudnnSync((tpudnnHandle_t)h); }}
+
+unsigned long long py_dev_malloc(unsigned long long size) {{
+  void *p = nullptr; tpuRtMalloc(&p, size, 1); return (unsigned long long)p;
+}}
+void py_dev_free(unsigned long long addr) {{ void *p = (void *)addr; tpuRtFree(&p, 1); }}
+void py_memcpy_h2d(unsigned long long dst, const void *src, unsigned long long size) {{ tpuRtMemcpyS2D((void *)dst, src, size); }}
+void py_memcpy_d2h(void *dst, unsigned long long src, unsigned long long size) {{ tpuRtMemcpyD2S(dst, (void *)src, size); }}
+
+{launch}
+int py_enable_profile(void *h, int max_record_num, int mode) {{
+  return (int)tpudnnEnableProfile((tpudnnHandle_t)h, max_record_num, mode);
+}}
+
+int py_disable_profile(void *h) {{
+  return (int)tpudnnDisableProfile((tpudnnHandle_t)h);
+}}
+
+}}  // extern "C"
+"""
+
+
+def _build_common(
+    pl_content: str,
+    kernel_name: str,
+    wrapper_text: str,
     workdir: str,
     *,
     chip: str = "sg2260e",
     opt: str = "O3",
     verbose: bool = False,
 ) -> dict[str, str]:
-    """Emit .pl, compile device code, cmake-build libkernel.so + ctypes wrapper + test_case.
+    """Emit .pl + ctypes wrapper, compile device code, cmake-build the .so's.
 
-    Always compiles with ``--autotune`` so the ``test_case`` binary includes
-    profiling instrumentation.  Profiling data can be collected later via
-    ``run_profiling()`` without recompilation.
-
-    Uses the inline path (calling ``ppl-compile`` binary + cmake directly) when
-    the ``ppl-compile`` binary is found.  Falls back to shelling out to
-    ``ppl_compile.py`` as a subprocess otherwise (profiling unavailable in
-    fallback mode).
-
-    Compilation is device-agnostic — no device ID is needed here.
-
-    Returns a dict with paths:
-        {"pl", "kernel_so", "wrapper_so", "test_case", "workdir"}.
-    ``test_case`` may be ``None`` when built via the fallback path.
+    Content-hash cached on ``pl_content``.  Returns
+    ``{"pl", "kernel_so", "wrapper_so", "test_case", "workdir"}``.
     """
     logger.warning("[TPU]: ppl_runner->build()")
     ppl_root = _get_ppl_root()
     chip_arch = _resolve_chip_arch(ppl_root, chip)
 
     os.makedirs(workdir, exist_ok=True)
-    pl_content = emit_pl(spec)
-    pl_path = os.path.join(workdir, f"{spec.kernel_name}.pl")
+    pl_path = os.path.join(workdir, f"{kernel_name}.pl")
     kernel_so = os.path.join(workdir, "lib", "libkernel.so")
-    wrapper_so = os.path.join(workdir, "lib", f"{spec.kernel_name}_py.so")
+    wrapper_so = os.path.join(workdir, "lib", f"{kernel_name}_py.so")
     test_case = os.path.join(workdir, "test_case")
 
     cached = False
@@ -793,7 +875,7 @@ def build(
 
     compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
     if os.path.isfile(compiler_bin):
-        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, spec.kernel_name)
+        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, kernel_name)
         _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
                          autotune=True, verbose=verbose)
         _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
@@ -804,14 +886,14 @@ def build(
     if not os.path.isfile(kernel_so):
         raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
 
-    wrapper_src = f"{spec.kernel_name}_py_wrapper.cpp"
+    wrapper_src = f"{kernel_name}_py_wrapper.cpp"
     wrapper_path = os.path.join(workdir, wrapper_src)
     with open(wrapper_path, "w") as f:
-        f.write(_WRAPPER_TEMPLATE.format(kernel_name=spec.kernel_name))
+        f.write(wrapper_text)
 
     cmake_path = os.path.join(workdir, "CMakeLists.txt")
     with open(cmake_path, "a") as f:
-        f.write(_wrapper_cmake_fragment(spec.kernel_name, wrapper_src))
+        f.write(_wrapper_cmake_fragment(kernel_name, wrapper_src))
 
     build_dir = os.path.join(workdir, "build")
     if not os.path.isdir(build_dir):
@@ -821,7 +903,7 @@ def build(
         check=True, cwd=workdir,
     )
     subprocess.run(
-        ["cmake", "--build", build_dir, "--target", f"{spec.kernel_name}_py", "-j"],
+        ["cmake", "--build", build_dir, "--target", f"{kernel_name}_py", "-j"],
         check=True, cwd=workdir,
     )
     subprocess.run(
@@ -835,6 +917,38 @@ def build(
     logger.warning(f"[TPU]: ppl_runner->build() done, kernel_so = {kernel_so}, wrapper_so = {wrapper_so}")
     return {"pl": pl_path, "kernel_so": kernel_so, "wrapper_so": wrapper_so,
             "test_case": tc, "workdir": workdir}
+
+
+def build(
+    spec: "PPLGemmSpec",
+    workdir: str,
+    *,
+    chip: str = "sg2260e",
+    opt: str = "O3",
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Build the legacy hand-written GEMM template kernel (``compile_gemm`` path)."""
+    wrapper_text = _WRAPPER_TEMPLATE.format(kernel_name=spec.kernel_name)
+    return _build_common(
+        _emit_gemm_template(spec), spec.kernel_name, wrapper_text, workdir,
+        chip=chip, opt=opt, verbose=verbose,
+    )
+
+
+def build_generic(
+    info: "PPLKernelInfo",
+    workdir: str,
+    *,
+    chip: str = "sg2260e",
+    opt: str = "O3",
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Build a translator-generated kernel (generic ``compile`` path)."""
+    wrapper_text = _generic_wrapper_src(info.kernel_name, len(info.args))
+    return _build_common(
+        info.source, info.kernel_name, wrapper_text, workdir,
+        chip=chip, opt=opt, verbose=verbose,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1184,3 +1298,67 @@ class PPLKernel:
             self.lib.py_dev_free(b_addr)
             self.lib.py_dev_free(c_addr)
         return c
+
+
+class PPLGenericKernel(PPLKernel):
+    """ctypes handle to a translator-generated PPL kernel on TPU.
+
+    Reuses :class:`PPLKernel`'s device management (init/close/h2d/d2h/profile),
+    but binds the launch signature and ``run`` generically from a
+    :class:`~tilelang.tpu.ppl_codegen.PPLKernelInfo`: N pointer arguments in
+    PrimFunc param order (inputs + pre-allocated outputs), no runtime int args.
+    """
+
+    def __init__(self, paths: dict[str, str], *, device: int = 0,
+                 kernel_name: str = "tl_kernel", info: PPLKernelInfo | None = None):
+        super().__init__(paths, device=device, kernel_name=kernel_name)
+        assert info is not None, "PPLGenericKernel requires a PPLKernelInfo"
+        self.info = info
+        # Base __init__ bound the GEMM launch signature; rebind for N pointers.
+        launch = getattr(self.lib, f"py_{kernel_name}")
+        launch.argtypes = [ctypes.c_void_p] + [ctypes.c_uint64] * len(info.args)
+        launch.restype = ctypes.c_int
+        self._launch = launch
+
+    def run(self, *inputs: torch.Tensor):
+        """Run the kernel: H2D each input, allocate outputs, launch, D2H outputs.
+
+        ``inputs`` are CPU torch tensors in the order of ``info.inputs`` (the
+        non-output params).  Returns the single output tensor, or a tuple when
+        the kernel declares multiple outputs.
+        """
+        logger.warning("[TPU]: PPLGenericKernel->run()")
+        in_args = self.info.inputs
+        if len(inputs) != len(in_args):
+            raise ValueError(
+                f"{self.kernel_name} expects {len(in_args)} inputs, got {len(inputs)}")
+
+        addr_by_name: dict[str, int] = {}
+        to_free: list[int] = []
+        out_tensors: dict[str, tuple[torch.Tensor, int]] = {}
+        try:
+            for arg, t in zip(in_args, inputs):
+                t = t.detach().cpu().to(_TORCH_DTYPE[arg.torch_dtype]).contiguous()
+                addr = self._h2d(t)
+                addr_by_name[arg.name] = addr
+                to_free.append(addr)
+            for arg in self.info.outputs:
+                ot = torch.empty(tuple(arg.shape), dtype=_TORCH_DTYPE[arg.torch_dtype])
+                oaddr = self.lib.py_dev_malloc(ot.numel() * ot.element_size())
+                addr_by_name[arg.name] = oaddr
+                to_free.append(oaddr)
+                out_tensors[arg.name] = (ot, oaddr)
+
+            addrs = [addr_by_name[a.name] for a in self.info.args]
+            if self._launch(self.handle, *addrs) != 0:
+                raise RuntimeError(f"{self.kernel_name} launch failed")
+            self.lib.py_sync_device(self.handle)
+            for _name, (ot, oaddr) in out_tensors.items():
+                self._d2h(oaddr, ot)
+        finally:
+            for a in to_free:
+                self.lib.py_dev_free(a)
+
+        outs = [out_tensors[a.name][0] for a in self.info.outputs]
+        return outs[0] if len(outs) == 1 else tuple(outs)
+

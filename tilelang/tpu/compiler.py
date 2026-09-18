@@ -1,31 +1,30 @@
-"""tilelang TPU compiler facade (simplest path).
+"""tilelang TPU compiler facade (generic TIR->PPL path).
 
-Exposes a tilelang-style compile entry point for the SG2260E TPU backed by the
+Exposes the tilelang-style compile entry point for the SG2260E TPU backed by the
 PPL toolchain (see :mod:`tilelang.tpu.ppl_runner`).
 
-Scope of this first implementation:
-  * fp16 GEMM with fp32 accumulator, optional ReLU, square tiles that divide
-    M/K/N evenly (no boundary handling).
-  * This is exactly ``test_tilelang/test_gemm_naive.py``'s kernel, and the
-    emitted PPL kernel was verified on real TPU ``devid 2`` to match
-    ``torch.relu(a @ b)`` within ``rtol=atol=1e-2``.
+``compile(func)`` is **generic**: it walks a *lowered* tilelang ``PrimFunc`` (the
+output of ``JITImpl.get_tir`` / a ``@tilelang.jit(target="tpu")`` trace) op-by-op
+via :mod:`tilelang.tpu.ppl_codegen` and emits PPL -- no per-family template.  The
+same path serves GEMM, flash-attention, and future fused kernels.
 
-The deep ``@tilelang.jit(target="tpu")`` TVM-adapter integration is left as a
-documented next step; this module delivers a working, testable TPU code path
-today.
+The legacy hand-written GEMM(+ReLU) template (``compile_gemm`` / ``PPLGemmSpec``)
+is retained for the runtime-int-shape / multi-core / multi-buffer GEMM variants
+and for ``run_profiling``; it is *not* on the generic ``.compile()`` path.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
 from tilelang.tpu.ppl_runner import (
-    PPLKernel, PPLGemmSpec, build, emit_pl, get_tpu_device, _collect_profile_data,
+    PPLKernel, PPLGenericKernel, PPLGemmSpec, PPLKernelInfo, build, build_generic,
+    emit_pl, get_tpu_device, _collect_profile_data,
 )
 import logging
 
@@ -46,34 +45,35 @@ class _TPUProfiler:
 
     def do_bench(self) -> float:
         k = self._kernel
-        if k._a is None:
+        if k._last_inputs is None:
             raise RuntimeError("call the kernel once before profiling")
         for _ in range(self._warmup):
-            k(k._a, k._b)
+            k(*k._last_inputs)
         t0 = time.perf_counter()
         for _ in range(self._iters):
-            k(k._a, k._b)
+            k(*k._last_inputs)
         return (time.perf_counter() - t0) / self._iters * 1e3
 
 
 # --------------------------------------------------------------------------- #
-# Compiled kernel                                                              #
+# Compiled kernel (generic)                                                    #
 # --------------------------------------------------------------------------- #
 
 
 class TPUKernel:
-    """A compiled TPU GEMM(+ReLU) kernel.
+    """A compiled TPU kernel produced by the generic TIR->PPL translator.
 
-    Callable as ``c = kernel(a, b)`` with fp16 CPU torch tensors.
+    Callable as ``out = kernel(*inputs)`` with CPU torch tensors (one per
+    non-output PrimFunc param, in order); inputs are cast to the kernel's
+    declared dtypes.  Returns the output tensor (or a tuple for multi-output).
     """
 
-    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int | None = None):
-        self.spec = spec
+    def __init__(self, info: PPLKernelInfo, paths: dict[str, str], *, device: int | None = None):
+        self.info = info
         self.paths = paths
         self._device = device
-        self._runtime: PPLKernel | None = None
-        self._a: torch.Tensor | None = None
-        self._b: torch.Tensor | None = None
+        self._runtime: PPLGenericKernel | None = None
+        self._last_inputs: list[torch.Tensor] | None = None
         self._profile_config: dict[str, Any] | None = None
 
     @property
@@ -82,10 +82,11 @@ class TPUKernel:
             self._device = get_tpu_device()
         return self._device
 
-    def _ensure_runtime(self) -> PPLKernel:
+    def _ensure_runtime(self) -> PPLGenericKernel:
         if self._runtime is None:
-            rt = PPLKernel(
-                self.paths, device=self.device, kernel_name=self.spec.kernel_name
+            rt = PPLGenericKernel(
+                self.paths, device=self.device,
+                kernel_name=self.info.kernel_name, info=self.info,
             )
             rt.init()
             if self._profile_config is not None:
@@ -95,17 +96,16 @@ class TPUKernel:
             self._runtime = rt
         return self._runtime
 
-    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        a = a.detach().cpu().contiguous()
-        b = b.detach().cpu().contiguous()
-        self._a, self._b = a, b
+    def __call__(self, *inputs: torch.Tensor):
+        casted = [t.detach().cpu().contiguous() for t in inputs]
+        self._last_inputs = casted
         try:
-            return self._ensure_runtime().run(a, b)
+            return self._ensure_runtime().run(*casted)
         except (RuntimeError, OSError):
-            # Device handle may be stale (e.g. invalidated by another
-            # config's py_init_device during autotuning).  Reinitialize.
+            # Device handle may be stale (e.g. invalidated by another config's
+            # py_init_device during autotuning).  Reinitialize and retry once.
             self.close()
-            return self._ensure_runtime().run(a, b)
+            return self._ensure_runtime().run(*casted)
 
     def enable_profile(
         self,
@@ -117,11 +117,6 @@ class TPUKernel:
         """Enable hardware profiling for subsequent kernel runs.
 
         Must be called *before* the first ``__call__`` (or after ``close()``).
-        Sets ``BMLIB_ENABLE_ALL_PROFILE=1`` so that ``tpuRtInit`` enables the
-        profiling subsystem, then ``tpudnnEnableProfile`` is called on the
-        handle during device init.
-
-        After the kernel run, call ``collect_profile()`` to process the data.
         """
         os.environ["BMLIB_ENABLE_ALL_PROFILE"] = "1"
         os.environ["PROFILE_BOOK_KEEPING"] = str(book_keeping)
@@ -137,13 +132,7 @@ class TPUKernel:
             self._runtime = None
 
     def collect_profile(self, *, verbose: bool = False) -> dict[str, Any]:
-        """Process profiling data from the last profiled run.
-
-        Closes the device handle first — the TPU runtime flushes
-        ``cdm_profile_data_dev*`` files during handle destruction.
-
-        Returns ``{"profiling_dir", "overall_us", "summary_path", "pftrace_path"}``.
-        """
+        """Process profiling data from the last profiled run."""
         if self._profile_config is None:
             raise RuntimeError("Profiling not enabled — call enable_profile() first")
         if self._runtime is not None:
@@ -152,7 +141,7 @@ class TPUKernel:
         return _collect_profile_data(self._profile_config["dir"], verbose=verbose)
 
     def get_kernel_source(self, kernel_only: bool = True) -> str:
-        return emit_pl(self.spec)
+        return self.info.source
 
     def get_profiler(self, **_kw: Any) -> "_TPUProfiler":
         return _TPUProfiler(self)
@@ -170,12 +159,108 @@ class TPUKernel:
 
 
 # --------------------------------------------------------------------------- #
-# Compile entry points                                                         #
+# Generic compile entry point                                                  #
 # --------------------------------------------------------------------------- #
 
 
+def compile(
+    func: Any,
+    *,
+    out_idx: int | list[int] = -1,
+    target: str = "tpu",
+    workdir: str | None = None,
+    **build_kw: Any,
+) -> TPUKernel:
+    """Compile a *lowered* tilelang PrimFunc for the TPU (generic TIR->PPL).
+
+    Walks the lowered TIR op-by-op (:func:`tilelang.tpu.ppl_runner.emit_pl` ->
+    :mod:`tilelang.tpu.ppl_codegen`), builds the ``.pl`` with the PPL toolchain,
+    and returns a callable :class:`TPUKernel`.  Shapes are baked from the TIR
+    (one compile per shape); the emitted ``__KERNEL__`` takes only pointers.
+
+    Compilation is device-agnostic — the device ID is resolved at runtime from
+    ``$TPU_VISIBLE_DEVICES`` when the kernel is first called.
+    """
+    logger.warning("[TPU]: tpu_compiler()")
+    if target != "tpu":
+        raise ValueError(f"tilelang.tpu.compile only supports target='tpu', got {target!r}.")
+    # Accept either a PrimFunc or a callable producing one.
+    if callable(func) and not hasattr(func, "buffer_map"):
+        func = func()
+
+    info = emit_pl(func)
+
+    if workdir is None:
+        tag = hashlib.md5(info.source.encode()).hexdigest()[:12]
+        workdir = os.path.join("/tmp", f"tilelang_tpu_{info.kernel_name}_{tag}")
+    paths = build_generic(info, workdir, **build_kw)
+    return TPUKernel(info, paths)
+
+
+# --------------------------------------------------------------------------- #
+# Legacy hand-written GEMM template path (compile_gemm / run_profiling)         #
+# --------------------------------------------------------------------------- #
+
+
+class TPUGemmKernel:
+    """A compiled TPU GEMM(+ReLU) kernel from the legacy hand-written template.
+
+    Callable as ``c = kernel(a, b)`` with fp16 CPU torch tensors.  Used only by
+    :func:`compile_gemm` (runtime-int-shape / multi-core / multi-buffer GEMM).
+    """
+
+    def __init__(self, spec: PPLGemmSpec, paths: dict[str, str], *, device: int | None = None):
+        self.spec = spec
+        self.paths = paths
+        self._device = device
+        self._runtime: PPLKernel | None = None
+        self._a: torch.Tensor | None = None
+        self._b: torch.Tensor | None = None
+
+    @property
+    def device(self) -> int:
+        if self._device is None:
+            self._device = get_tpu_device()
+        return self._device
+
+    def _ensure_runtime(self) -> PPLKernel:
+        if self._runtime is None:
+            rt = PPLKernel(self.paths, device=self.device, kernel_name=self.spec.kernel_name)
+            rt.init()
+            self._runtime = rt
+        return self._runtime
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a = a.detach().cpu().contiguous()
+        b = b.detach().cpu().contiguous()
+        self._a, self._b = a, b
+        try:
+            return self._ensure_runtime().run(a, b)
+        except (RuntimeError, OSError):
+            self.close()
+            return self._ensure_runtime().run(a, b)
+
+    def get_kernel_source(self, kernel_only: bool = True) -> str:
+        from tilelang.tpu.ppl_runner import _emit_gemm_template
+        return _emit_gemm_template(self.spec)
+
+    def get_profiler(self, **_kw: Any) -> "_TPUProfiler":
+        prof = _TPUProfiler(self)  # type: ignore[arg-type]
+        return prof
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _concrete_or_default(val: Any, default: int = 1024) -> int:
-    """Return val as int if concrete, else default."""
     try:
         return int(val)
     except (TypeError, ValueError):
@@ -183,7 +268,6 @@ def _concrete_or_default(val: Any, default: int = 1024) -> int:
 
 
 def _shape_tag(val: Any) -> str:
-    """Return a workdir-safe tag: the concrete value as a string, or 'dyn'."""
     try:
         return str(int(val))
     except (TypeError, ValueError):
@@ -205,19 +289,13 @@ def compile_gemm(
     workdir: str | None = None,
     kernel_name: str = "tl_gemm_relu",
     **build_kw: Any,
-) -> TPUKernel:
-    """Compile a GEMM(+ReLU) kernel for the TPU and return a callable.
+) -> TPUGemmKernel:
+    """Compile a GEMM(+ReLU) kernel via the legacy hand-written PPL template.
 
-    M, K, N may be symbolic (tirx.Var) for dynamic-shape kernels.  The PPL
-    __KERNEL__ takes M/K/N as runtime int args, so symbolic dims are replaced
-    by defaults (1024) only for the __TEST__ stub.  At runtime, actual tensor
-    shapes are passed through.
-
-    Compilation is device-agnostic.  The device ID is resolved at runtime from
-    ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
-
-    ``in_dtype`` is "fp16" (verified) or "bf16" (wild-guess; correctness N/A).
-    ``core_num`` is 1 (single-core) or >1 (multi-core, SG2260E has 4).
+    The PPL ``__KERNEL__`` takes M/K/N as runtime int args, so a single build
+    handles any divisible shape; symbolic dims are replaced by defaults (1024)
+    only for the ``__TEST__`` stub.  ``core_num`` selects the single/multi-core
+    template; ``num_stages`` selects the single/double-buffer template.
     """
     logger.warning("[TPU]: compile_gemm()")
     build_M = _concrete_or_default(M)
@@ -238,228 +316,4 @@ def compile_gemm(
             f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}{nb_tag}",
         )
     paths = build(spec, workdir, **build_kw)
-    return TPUKernel(spec, paths)
-
-
-def _detect_relu(func: Any) -> bool:
-    """True if the (lowered) PrimFunc contains a tir.Max node (the ReLU pattern)."""
-    try:
-        from tvm import tirx as _tir
-
-        found = [False]
-
-        def visit(node: Any) -> Any:
-            if isinstance(node, _tir.Max):
-                found[0] = True
-            return None
-
-        _tir.stmt_functor.post_order_visit(func.body, visit)
-        return found[0]
-    except Exception:
-        return True  # assume relu for the gemm-naive test
-
-
-def _try_int(s: Any) -> int | Any:
-    """Try to convert a TIR expression to int; return as-is if symbolic."""
-    try:
-        return int(s)
-    except (TypeError, ValueError):
-        return s
-
-
-def _shapes_from_func(func: Any) -> tuple[int | Any, int | Any, int | Any]:
-    """Extract (M, K, N) from a PrimFunc with buffers A:[M,K], B:[K,N], C:[M,N].
-
-    Dimensions may be symbolic (tirx.Var) for dynamic-shape kernels.
-    """
-    bufs = list(func.buffer_map.values())
-    if len(bufs) < 3:
-        raise ValueError("TPU compile expects 3 tensor buffers (A, B, C).")
-    a_shape = [_try_int(s) for s in bufs[0].shape]
-    b_shape = [_try_int(s) for s in bufs[1].shape]
-    if len(a_shape) != 2 or len(b_shape) != 2:
-        raise ValueError("TPU compile expects 2-D tensors.")
-    M, K = a_shape
-    K2, N = b_shape
-    return M, K, N
-
-
-# tilelang/tvm dtype -> PPL in-type token.  (accum is always fp32 / DT_FP32.)
-_DTYPE_TO_PPL = {"float16": "fp16", "bfloat16": "bf16", "fp16": "fp16", "bf16": "bf16"}
-
-
-def _tiles_from_func(func: Any, in_dtype: str) -> tuple[int, int, int]:
-    """Walk the lowered TIR to recover (block_m, block_k, block_n).
-
-    tilelang lowers ``T.alloc_shared`` / ``T.alloc_fragment`` into buffer
-    declarations on a ``SBlock`` node (``SBlock.alloc_buffers``), *not* into
-    plain ``tir.Allocate`` statements.  The GEMM kernel declares three 2-D
-    buffers there:
-      * A_shared  [block_m, block_k]  (in_dtype)
-      * B_shared  [block_k, block_n]  (in_dtype)
-      * C_local   [block_m, block_n]  (accum_dtype, fp32)
-    We pick the fp32 2-D buffer as C_local -> (block_m, block_n) and the
-    in_dtype 2-D buffers as the shared tiles -> block_k.  Falls back to
-    (64, 64, 64) if the IR shape is unexpected.
-    """
-    try:
-        from tvm import tirx as _tir
-
-        allocs: list[tuple[list[int], str]] = []
-
-        def visit(node: Any) -> Any:
-            # tilelang SBlock carries the alloc_buffers; SBlockRealize does not.
-            if type(node).__name__ != "SBlock":
-                return None
-            for buf in getattr(node, "alloc_buffers", []) or []:
-                try:
-                    shape = [int(s) for s in buf.shape]
-                except Exception:
-                    continue
-                if len(shape) == 2:
-                    allocs.append((shape, str(buf.dtype)))
-            return None
-
-        _tir.stmt_functor.post_order_visit(func.body, visit)
-    except Exception:
-        return 64, 64, 64
-
-    accum = "float32"
-    c_locals = [a for a in allocs if a[1] == accum]
-    shared = [a for a in allocs if a[1] != accum]
-    if not c_locals or len(shared) < 2:
-        return 64, 64, 64
-    block_m, block_n = c_locals[0][0]
-    # block_k = the shared dim that is neither block_m nor block_n.
-    cand = set()
-    for (e0, e1), _ in shared:
-        for e in (e0, e1):
-            if e != block_m and e != block_n:
-                cand.add(e)
-    if len(cand) == 1:
-        block_k = cand.pop()
-    else:
-        # fall back: second dim of the first shared alloc
-        block_k = shared[0][0][1]
-    return block_m, block_k, block_n
-
-
-def _in_dtype_from_func(func: Any) -> str:
-    """Read the input dtype from the first buffer and map to a PPL token."""
-    bufs = list(func.buffer_map.values())
-    dt = str(bufs[0].dtype)
-    return _DTYPE_TO_PPL.get(dt, "fp16")
-
-
-def _core_num_from_func(func: Any) -> int:
-    """Detect multi-core from the T.Kernel grid dimensionality.
-
-    A 2-axis ``T.Kernel(bx, by)`` is single-core (returns 1).
-    A 3-axis ``T.Kernel(bx, by, bc)`` produces a ``bz`` For-node with
-    ``kind=4`` (ThreadBinding) whose extent is the core count.
-    """
-    try:
-        from tvm import tirx as _tir
-
-        bz_extent: list[int] = []
-
-        def visit(node: Any) -> Any:
-            if type(node).__name__ != "For":
-                return None
-            if node.kind == 4 and str(node.loop_var) == "bz":
-                try:
-                    bz_extent.append(int(node.extent))
-                except (TypeError, ValueError):
-                    pass
-            return None
-
-        _tir.stmt_functor.post_order_visit(func.body, visit)
-        if bz_extent and bz_extent[0] > 1:
-            return bz_extent[0]
-    except Exception:
-        pass
-    return 1
-
-
-def _num_stages_from_func(func: Any) -> int:
-    """Detect pipeline num_stages from T.Pipelined For-node annotations.
-
-    ``T.Pipelined(extent, num_stages=N)`` stores the stage count in
-    ``For.annotations["num_stages"]``.  Returns 1 (no pipelining) if absent.
-    """
-    try:
-        from tvm import tirx as _tir
-
-        stages: list[int] = []
-
-        def visit(node: Any) -> Any:
-            if type(node).__name__ != "For":
-                return None
-            ann = dict(node.annotations) if node.annotations else {}
-            if "num_stages" in ann:
-                try:
-                    stages.append(int(ann["num_stages"]))
-                except (TypeError, ValueError):
-                    pass
-            return None
-
-        _tir.stmt_functor.post_order_visit(func.body, visit)
-        if stages and stages[0] > 1:
-            return stages[0]
-    except Exception:
-        pass
-    return 1
-
-
-def compile(
-    func: Any,
-    *,
-    out_idx: int | list[int] = -1,
-    target: str = "tpu",
-    workdir: str | None = None,
-    block_m: int | None = None,
-    block_k: int | None = None,
-    block_n: int | None = None,
-    in_dtype: str | None = None,
-    core_num: int | None = None,
-    num_stages: int | None = None,
-    **build_kw: Any,
-) -> TPUKernel:
-    """Compile a *lowered* tilelang PrimFunc for the TPU (GEMM[+ReLU] codegen).
-
-    This is the codegen entry point of the tilelang -> TPU path.  It walks the
-    lowered TIR (the output of ``tilelang.JITImpl.get_tir`` / ``tilelang.lower``)
-    to recover the concrete GEMM shape (M, K, N), the tile sizes
-    (block_m, block_k, block_n) from the shared/fragment allocations, the input
-    dtype (fp16 or bf16), and whether ReLU is present (``tir.Max``).  It then
-    emits a PPL ``.pl`` kernel, builds it with the PPL toolchain, and returns a
-    callable ``TPUKernel``.
-
-    Compilation is device-agnostic.  The device ID is resolved at runtime from
-    ``$TPU_VISIBLE_DEVICES`` (default 0) when the kernel is first called.
-
-    Tile sizes / dtype / core_num passed explicitly override the IR-derived values.
-    """
-    logger.warning("[TPU]: tpu_compiler()")
-    if target != "tpu":
-        raise ValueError(f"tilelang.tpu.compile only supports target='tpu', got {target!r}.")
-    # Accept either a PrimFunc or a callable producing one.
-    if callable(func) and not hasattr(func, "buffer_map"):
-        func = func()
-    M, K, N = _shapes_from_func(func)
-    relu = _detect_relu(func)
-    ir_in = _in_dtype_from_func(func)
-    ir_bm, ir_bk, ir_bn = _tiles_from_func(func, ir_in)
-    ir_core = _core_num_from_func(func)
-    ir_stages = _num_stages_from_func(func)
-    return compile_gemm(
-        M, K, N,
-        block_m=block_m if block_m is not None else ir_bm,
-        block_k=block_k if block_k is not None else ir_bk,
-        block_n=block_n if block_n is not None else ir_bn,
-        relu=relu, workdir=workdir,
-        in_dtype=in_dtype if in_dtype is not None else ir_in,
-        core_num=core_num if core_num is not None else ir_core,
-        num_stages=num_stages if num_stages is not None else ir_stages,
-        **build_kw,
-    )
+    return TPUGemmKernel(spec, paths)

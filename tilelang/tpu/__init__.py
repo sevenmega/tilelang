@@ -8,7 +8,11 @@ from . import compiler  # noqa: F401
 from . import adapter  # noqa: F401
 from . import cache  # noqa: F401
 
-from .compiler import compile, compile_gemm  # noqa: F401
-from .ppl_runner import PPLGemmSpec, PPLKernel, build, emit_pl  # noqa: F401
+from . import kernels  # noqa: F401
+from .compiler import compile, compile_gemm, TPUKernel  # noqa: F401
+from .ppl_runner import (  # noqa: F401
+    PPLGemmSpec, PPLKernel, PPLGenericKernel, build, build_generic, emit_pl,
+)
+from .ppl_codegen import translate, PPLKernelInfo, BufArg  # noqa: F401
 from .adapter import PPLKernelAdapter  # noqa: F401
 from .cache import PPLKernelCache  # noqa: F401

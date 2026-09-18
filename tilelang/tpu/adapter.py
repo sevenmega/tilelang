@@ -42,7 +42,7 @@ class PPLKernelAdapter:
         n_inputs = n_params - n_outputs
 
         if len(args) == n_inputs:
-            # Auto-allocate mode: kernel(a, b) — only inputs provided.
+            # Auto-allocate mode: kernel(*inputs) — only inputs provided.
             # Run the kernel and return the result, cast to declared dtype.
             inputs: list[Any] = []
             ins_idx = 0
@@ -50,20 +50,18 @@ class PPLKernelAdapter:
                 if i not in self.result_idx:
                     inputs.append(args[ins_idx])
                     ins_idx += 1
-            if len(inputs) < 2:
-                raise ValueError("PPL GEMM kernel expects at least 2 tensor inputs (A, B)")
-            result = self._tpu_kernel(inputs[0], inputs[1])
-            if self.result_idx:
+            result = self._tpu_kernel(*inputs)
+            if self.result_idx and isinstance(result, torch.Tensor):
                 declared_dtype = self.params[self.result_idx[0]].torch_dtype()
                 if result.dtype != declared_dtype:
                     result = result.to(declared_dtype)
             return result
 
         if len(args) == n_params:
-            # Write-into mode: kernel(a, b, c) — all params including
-            # pre-allocated output tensor(s).  Run the kernel with the
-            # input tensors, then copy the result into the caller's
-            # output tensor (handles dtype conversion via copy_()).
+            # Write-into mode: kernel(*inputs, *outputs) — all params including
+            # pre-allocated output tensor(s).  Run the kernel with the input
+            # tensors, then copy the result(s) into the caller's output
+            # tensor(s) (handles dtype conversion via copy_()).
             inputs = []
             outputs = []
             for i in range(n_params):
@@ -71,11 +69,10 @@ class PPLKernelAdapter:
                     outputs.append(args[i])
                 else:
                     inputs.append(args[i])
-            if len(inputs) < 2:
-                raise ValueError("PPL GEMM kernel expects at least 2 tensor inputs (A, B)")
-            result = self._tpu_kernel(inputs[0], inputs[1])
-            for out in outputs:
-                out.copy_(result)
+            result = self._tpu_kernel(*inputs)
+            results = list(result) if isinstance(result, tuple) else [result]
+            for out, res in zip(outputs, results):
+                out.copy_(res)
             return None
 
         raise ValueError(

@@ -39,6 +39,11 @@ def matmul_naive(
 
 M, N, K = 1024, 1024, 1024
 
+print("func_source:")
+print(matmul_naive.func_source)
+print("signature:")
+print(matmul_naive.signature)
+
 print("TIR:")
 print(matmul_naive.get_tir(M=M, N=N, K=K).script())
 
@@ -58,12 +63,15 @@ if __name__ == "__main__":
 
         a = torch.randn(M, K, dtype=torch.float16)
         b = torch.randn(K, N, dtype=torch.float16)
+        # c = matmul_naive(a, b)
         c = kernel(a, b)
-        ref = torch.relu(a.float() @ b.float()).half()
-        if torch.allclose(c, ref, rtol=1e-2, atol=1e-2):
+        c_ref = torch.relu(a.float() @ b.float()).half()
+
+        # torch.testing.assert_close(c, c_ref, rtol=1e-2, atol=1e-2)
+        if torch.allclose(c, c_ref, rtol=1e-2, atol=1e-2):
             print("PASS: TPU result matches torch reference")
         else:
-            max_diff = (c - ref).abs().max().item()
+            max_diff = (c - c_ref).abs().max().item()
             print(f"FAIL: max diff = {max_diff}")
             sys.exit(1)
 

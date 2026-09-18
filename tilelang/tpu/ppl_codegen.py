@@ -71,8 +71,34 @@ class BufArg:
     ptr_name: str        # C pointer param name (e.g. "ptr_Q")
     ppl_dtype: str       # "fp16" / "bf16" / "fp32"
     torch_dtype: str     # "float16" / "bfloat16" / "float32"
-    shape: tuple[int, ...]  # natural (row-major) buffer shape
+    shape: tuple[Any, ...]  # natural (row-major) buffer shape; entries may be
+                            # int (static) or a TIR Var name (dynamic)
     is_output: bool
+
+
+@dataclass
+class ShapeDim:
+    """One emitted ``dim4`` component: a literal or a runtime dim variable."""
+
+    text: str            # C expression, e.g. "1024" or "M"
+
+
+def _dim_text(s: Any) -> str:
+    """Render one buffer-shape entry as a C expression."""
+    try:
+        return str(int(s))
+    except (TypeError, ValueError):
+        return str(s)
+
+
+def shape_to_dim4(shape: tuple[Any, ...]) -> tuple[ShapeDim, ...]:
+    """Pad a natural shape to 4D by prepending 1s (no permutation)."""
+    seq = [_dim_text(s) for s in shape]
+    while len(seq) < 4:
+        seq.insert(0, "1")
+    if len(seq) > 4:
+        raise NotImplementedError(f"buffer rank >4 not supported: {seq}")
+    return tuple(ShapeDim(text=t) for t in seq)
 
 
 @dataclass
@@ -82,6 +108,10 @@ class PPLKernelInfo:
     kernel_name: str
     args: list[BufArg]
     source: str = ""
+    # Dynamic (symbolic) buffer extents, in parameter-declaration order.  Each
+    # gets its own trailing ``int`` argument on the emitted ``__KERNEL__``; the
+    # runtime resolves their values from the input tensors' shapes at launch.
+    dyn_dims: list[str] = field(default_factory=list)
 
     @property
     def inputs(self) -> list[BufArg]:
@@ -123,6 +153,15 @@ def _render_index(e: Any) -> str:
         return str(int(e))
     except (TypeError, ValueError):
         raise NotImplementedError(f"cannot render index expr {tn}: {e}")
+
+
+def _is_symbolic(e: Any) -> bool:
+    """True when a TIR extent is a symbolic var rather than a constant."""
+    try:
+        int(e)
+        return False
+    except (TypeError, ValueError):
+        return True
 
 
 def _is_zero(e: Any) -> bool:
@@ -167,7 +206,7 @@ class PPLEmitter:
 
     ORDER = (0, 2, 1, 3)
 
-    def __init__(self, func: Any, kernel_name: str):
+    def __init__(self, func: Any, kernel_name: str, out_idx: list[int] | None = None):
         self.func = func
         self.kernel_name = kernel_name
         self.lines: list[str] = []
@@ -178,16 +217,30 @@ class PPLEmitter:
         self.global_bufs: dict[str, Any] = {}
         self.locals: dict[str, tuple[tuple[int, int, int, int], str]] = {}
 
-        out_idx = [int(i) for i in func.attrs["tilelang_out_idx"]]
+        # Which params are outputs.  The eager-trace path records this in the
+        # `tilelang_out_idx` attr; the `@T.prim_func` path does not set it at
+        # all, so the caller (tilelang.tpu.compiler.compile) passes it down.
+        # A negative index counts from the end of the param list.
+        if out_idx is None:
+            out_idx = func.attrs.get("tilelang_out_idx", [-1])
+        if isinstance(out_idx, int):
+            out_idx = [out_idx]
+        out_idx = [int(i) for i in out_idx]
         params = list(func.params)
         n = len(params)
         out_set = {i % n for i in out_idx}
 
         self.args: list[BufArg] = []
+        self.dyn_names: list[str] = []  # symbolic extents, in declaration order
         for i, p in enumerate(params):
             buf = func.buffer_map[p]
             ppl_dt = _ppl_dtype(buf.dtype)
-            shape = tuple(int(s) for s in buf.shape)
+            shape = tuple(buf.shape)
+            for s in shape:
+                if _is_symbolic(s):
+                    name = str(s)
+                    if name not in self.dyn_names:
+                        self.dyn_names.append(name)
             arg = BufArg(
                 name=buf.name,
                 ptr_name=f"ptr_{buf.name}",
@@ -199,6 +252,15 @@ class PPLEmitter:
             self.args.append(arg)
             self.globals[buf.name] = arg
             self.global_bufs[buf.name] = buf
+
+    def _dim4_of(self, shape: tuple[Any, ...]) -> tuple[ShapeDim, ...]:
+        """Natural shape -> dim4 entries (pad to 4D by prepending 1s).
+
+        No ``ORDER`` permutation here: ``ORDER`` belongs to the *src* order of
+        ``make_gtensor_permute`` (which the ``_mem_shape`` declaration feeds),
+        not to the already-permuted logical shape.
+        """
+        return shape_to_dim4(shape)
 
     # -- naming helpers ---------------------------------------------------- #
 
@@ -238,13 +300,34 @@ class PPLEmitter:
     def _permute4(self, padded: list[Any]) -> list[Any]:
         return [padded[o] for o in self.ORDER]
 
+    @staticmethod
+    def _dim4_str_dyn(d4: tuple[ShapeDim, ...]) -> str:
+        return "{" + ", ".join(sd.text for sd in d4) + "}"
+
+    # -- runtime dim arguments --------------------------------------------- #
+
+    def emit_dyn_dim_decls(self) -> None:
+        """Materialize the runtime shape args as dim-variable aliases.
+
+        The wrapper passes them as ``int`` (promoted from ``unsigned long long``);
+        block-extent arithmetic keeps them in symbolically-rendered C
+        expressions, so nothing else needs to know they are runtime values.
+        """
+        for name in self.dyn_names:
+            self.emit(f"const int {name} = (int){name}_dim;")
+
+    def emit_dyn_dim_comment(self) -> None:
+        if self.dyn_names:
+            self.emit(f"// runtime dims: {', '.join(self.dyn_names)}")
+
     # -- global tensor declarations ---------------------------------------- #
 
     def emit_global_decls(self) -> None:
         self.emit("int order[4] = {0, 2, 1, 3};")
         for arg in self.args:
-            mem = self._pad4_prepend([str(s) for s in arg.shape], "1")
-            self.emit(f"dim4 {arg.name}_mem_shape = {{{', '.join(mem)}}};")
+            d4 = self._dim4_of(arg.shape)
+            mem = ", ".join(sd.text for sd in shape_to_dim4(arg.shape))
+            self.emit(f"dim4 {arg.name}_mem_shape = {{{mem}}};")
             self.emit(
                 f"auto {arg.name}_gt = make_gtensor_permute<{arg.ppl_dtype}>("
                 f"{arg.name}_mem_shape, GLOBAL, {arg.ptr_name}, order);"
@@ -598,8 +681,12 @@ class PPLEmitter:
     def run(self) -> PPLKernelInfo:
         grid, allocs, body = self._walk_to_kernel()
 
-        # kernel signature
-        sig = ", ".join(f"{a.ppl_dtype} *{a.ptr_name}" for a in self.args)
+        # kernel signature: pointer args, then one int per symbolic extent.
+        # Dyn dims carry no C default: PPL binds this entry point by name and
+        # always passes them explicitly (see ppl_runner._generic_wrapper_src).
+        sig_ptrs = ", ".join(f"{a.ppl_dtype} *{a.ptr_name}" for a in self.args)
+        sig_dims = ", ".join(f"int {n}_dim" for n in self.dyn_names)
+        sig = ", ".join(s for s in (sig_ptrs, sig_dims) if s)
         self.lines.append('#include "ppl.h"')
         self.lines.append('#include "ppl_wrapper_func.h"')
         self.lines.append("")
@@ -607,10 +694,11 @@ class PPLEmitter:
         self.lines.append("")
         self.lines.append(f"__KERNEL__ void {self.kernel_name}({sig}) {{")
 
+        self.emit_dyn_dim_decls()
         self.emit_global_decls()
 
         # grid loops
-        indent_base = 1
+        indent_base = 2
         for g in grid:
             var = g.loop_var.name
             ext = _render_index(g.extent)
@@ -633,26 +721,74 @@ class PPLEmitter:
         self._emit_test_stub()
 
         source = "\n".join(self.lines) + "\n"
-        return PPLKernelInfo(kernel_name=self.kernel_name, args=self.args, source=source)
+        return PPLKernelInfo(
+            kernel_name=self.kernel_name,
+            args=self.args,
+            source=source,
+            dyn_dims=list(self.dyn_names),
+        )
+
+    _TEST_STUB_DIM = 1024
 
     def _emit_test_stub(self) -> None:
+        """Emit the standalone ``__TEST__`` launcher.
+
+        Symbolic extents have no value to fall back on, so the stub picks a
+        concrete one per dim (``_TEST_STUB_DIM``, tile-aligned for the shapes
+        used here) purely so ``--gen_test`` has a well-typed call to emit.  The
+        Python runtime never invokes this path -- it drives ``__KERNEL__``
+        directly with the real dims.
+        """
         self.lines.append(f"__TEST__ void {self.kernel_name}_main() {{")
+        for n in self.dyn_names:
+            self.lines.append(f"  int {n} = {self._TEST_STUB_DIM};")
         call_args = []
         for a in self.args:
-            mem = self._pad4_prepend([str(s) for s in a.shape], "1")
-            self.lines.append(
-                f"  dim4 {a.name}_ts = {{{', '.join(mem)}}};")
+            mem = ", ".join(sd.text for sd in shape_to_dim4(a.shape))
+            self.lines.append(f"  dim4 {a.name}_ts = {{{mem}}};")
             self.lines.append(
                 f"  {a.ppl_dtype} *{a.ptr_name} = ppl::malloc<{a.ppl_dtype}>(&{a.name}_ts);")
             if not a.is_output:
                 self.lines.append(f"  ppl::rand({a.ptr_name}, &{a.name}_ts, -1.0, 1.0);")
             call_args.append(a.ptr_name)
+        call_args.extend(f"{n}" for n in self.dyn_names)
         self.lines.append(f"  {self.kernel_name}({', '.join(call_args)});")
         self.lines.append("}")
 
 
-def translate(func: Any, kernel_name: str | None = None) -> PPLKernelInfo:
-    """Translate a lowered tilelang PrimFunc into a PPL kernel + arg metadata."""
+# Names the PPL/C front end treats specially.  `main` is the sharp one: a
+# `@T.prim_func` nested inside a jit factory typically inherits `global_symbol
+# == "main"` from the inner Python function's name, and emitting `__KERNEL__
+# void main(...)` makes the C front end reject the file with "too many
+# parameters (N) for 'main': must be 0, 2, or 3".
+_RESERVED_KERNEL_NAMES = {
+    "main", "printf", "malloc", "free", "exit", "abort", "assert",
+    "memcpy", "memset", "rand", "srand", "sqrt", "exp", "log", "pow",
+    "min", "max", "abs", "floor", "ceil", "round",
+}
+
+
+def _sanitize_kernel_name(name: str) -> str:
+    """Return a name safe to emit as a PPL ``__KERNEL__`` entry point."""
+    clean = "".join(c if (c.isalnum() or c == "_") else "_" for c in str(name))
+    if not clean or clean[0].isdigit():
+        clean = "tl_" + clean
+    if clean in _RESERVED_KERNEL_NAMES:
+        clean += "_kernel"
+    return clean
+
+
+def translate(
+    func: Any,
+    kernel_name: str | None = None,
+    out_idx: int | list[int] | None = None,
+) -> PPLKernelInfo:
+    """Translate a lowered tilelang PrimFunc into a PPL kernel + arg metadata.
+
+    *out_idx* names the output param(s) (negative counts from the end).  When
+    omitted the ``tilelang_out_idx`` attr is used if present, else the last
+    param.
+    """
     if kernel_name is None:
         kernel_name = str(func.attrs.get("global_symbol", "tl_kernel"))
-    return PPLEmitter(func, kernel_name).run()
+    return PPLEmitter(func, _sanitize_kernel_name(kernel_name), out_idx=out_idx).run()

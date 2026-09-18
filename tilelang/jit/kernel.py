@@ -277,7 +277,7 @@ class JITKernel(Generic[_P, _T]):
             from tilelang.engine.lower import extrac_params
 
             with jit_phase("lower", verbose=verbose, **phase_context):
-                tpu_kernel = tpu_compile(tilelang_func, target="tpu")
+                tpu_kernel = tpu_compile(tilelang_func, target="tpu", out_idx=out_idx)
 
             # Emit a lower_trace codegen record (TIR -> PPL .pl source)
             self._emit_ppl_trace_record(tilelang_func, tpu_kernel)

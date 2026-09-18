@@ -188,7 +188,7 @@ def compile(
     if callable(func) and not hasattr(func, "buffer_map"):
         func = func()
 
-    info = emit_pl(func)
+    info = emit_pl(func, out_idx=out_idx)
 
     if workdir is None:
         tag = hashlib.md5(info.source.encode()).hexdigest()[:12]

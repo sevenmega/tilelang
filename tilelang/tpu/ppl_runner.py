@@ -685,7 +685,7 @@ class PPLGemmSpec:
 # --------------------------------------------------------------------------- #
 
 
-def emit_pl(func: Any) -> "PPLKernelInfo":
+def emit_pl(func: Any, out_idx: int | list[int] | None = None) -> "PPLKernelInfo":
     """Translate a lowered tilelang PrimFunc into a PPL kernel (generic path).
 
     This is the single generic codegen entry point: it walks the lowered TIR
@@ -693,8 +693,12 @@ def emit_pl(func: Any) -> "PPLKernelInfo":
     bodies) and emits PPL -- no per-family template.  Returns a
     :class:`~tilelang.tpu.ppl_codegen.PPLKernelInfo` carrying the ``.pl`` source
     and the ordered pointer-argument metadata the runtime binds against.
+
+    *out_idx* names the output param(s); it is forwarded from
+    ``tilelang.tpu.compiler.compile`` because the ``@T.prim_func`` lowering path
+    never materializes the ``tilelang_out_idx`` attr the eager path sets.
     """
-    return translate(func)
+    return translate(func, out_idx=out_idx)
 
 
 def _emit_gemm_template(spec: PPLGemmSpec) -> str:
@@ -763,19 +767,23 @@ def _build_via_ppl_compile_py(
     subprocess.run(cmd, check=True, cwd=workdir)
 
 
-def _generic_wrapper_src(kernel_name: str, num_args: int) -> str:
+def _generic_wrapper_src(kernel_name: str, num_args: int, num_dyn_dims: int = 0) -> str:
     """Build a ctypes wrapper .cpp for a translator-generated kernel.
 
     The generic ``__KERNEL__`` takes exactly ``num_args`` pointer arguments (in
-    PrimFunc param order; shapes are baked at compile time).  The launch entry
-    ``py_<kernel>`` therefore forwards a handle + ``num_args`` device addresses.
+    PrimFunc param order; shapes are baked at compile time) followed by
+    ``num_dyn_dims`` ``int`` runtime extents for any symbolic buffer dimension.
+    The launch entry ``py_<kernel>`` therefore forwards a handle, ``num_args``
+    device addresses, and that many dimension values.
     Device-management helpers are identical to the GEMM ``_WRAPPER_TEMPLATE``.
     """
+    dim_params = "".join(f", int d{i}" for i in range(num_dyn_dims))
     ptr_params = ", ".join(f"unsigned long long a{i}" for i in range(num_args))
     ptr_args = ", ".join(f"a{i}" for i in range(num_args))
+    dim_args = "".join(f", d{i}" for i in range(num_dyn_dims))
     launch = (
-        f"int py_{kernel_name}(void *h, {ptr_params}) {{\n"
-        f"  return {kernel_name}((tpudnnHandle_t)h, {ptr_args});\n"
+        f"int py_{kernel_name}(void *h, {ptr_params}{dim_params}) {{\n"
+        f"  return {kernel_name}((tpudnnHandle_t)h, {ptr_args}{dim_args});\n"
         f"}}\n"
     )
     return f"""// ctypes-callable wrapper around the generated {kernel_name} kernel launch.
@@ -944,7 +952,7 @@ def build_generic(
     verbose: bool = False,
 ) -> dict[str, str]:
     """Build a translator-generated kernel (generic ``compile`` path)."""
-    wrapper_text = _generic_wrapper_src(info.kernel_name, len(info.args))
+    wrapper_text = _generic_wrapper_src(info.kernel_name, len(info.args), len(info.dyn_dims))
     return _build_common(
         info.source, info.kernel_name, wrapper_text, workdir,
         chip=chip, opt=opt, verbose=verbose,
@@ -1197,7 +1205,6 @@ class PPLKernel:
         L.py_memcpy_h2d.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
         L.py_memcpy_d2h.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
         launch = getattr(L, f"py_{kn}")
-        print(type(launch))
         launch.argtypes = [
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -1300,13 +1307,28 @@ class PPLKernel:
         return c
 
 
+def _concrete_dim(s: Any, dims_by_name: dict[str, int]) -> int:
+    """Resolve one output-shape entry: a symbolic var's value, or the literal."""
+    name = str(s)
+    if name in dims_by_name:
+        return dims_by_name[name]
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"output dim {name!r} could not be resolved to a concrete value")
+
+
 class PPLGenericKernel(PPLKernel):
     """ctypes handle to a translator-generated PPL kernel on TPU.
 
     Reuses :class:`PPLKernel`'s device management (init/close/h2d/d2h/profile),
     but binds the launch signature and ``run`` generically from a
     :class:`~tilelang.tpu.ppl_codegen.PPLKernelInfo`: N pointer arguments in
-    PrimFunc param order (inputs + pre-allocated outputs), no runtime int args.
+    PrimFunc param order (inputs + pre-allocated outputs), followed by one
+    ``int`` per symbolic buffer dimension.  The dim values are resolved from the
+    input tensors' actual shapes at each call, so a single build serves any
+    shape the tiles divide evenly.
     """
 
     def __init__(self, paths: dict[str, str], *, device: int = 0,
@@ -1314,11 +1336,45 @@ class PPLGenericKernel(PPLKernel):
         super().__init__(paths, device=device, kernel_name=kernel_name)
         assert info is not None, "PPLGenericKernel requires a PPLKernelInfo"
         self.info = info
-        # Base __init__ bound the GEMM launch signature; rebind for N pointers.
+        # Inputs of the current run, kept only so _resolve_dims can read their
+        # shapes; cleared once the launch returns.
+        self._inputs: list[torch.Tensor] = []
+        # Base __init__ bound the GEMM launch signature; rebind for N pointers
+        # plus the runtime dims.
         launch = getattr(self.lib, f"py_{kernel_name}")
-        launch.argtypes = [ctypes.c_void_p] + [ctypes.c_uint64] * len(info.args)
+        launch.argtypes = (
+            [ctypes.c_void_p]
+            + [ctypes.c_uint64] * len(info.args)
+            + [ctypes.c_int] * len(info.dyn_dims)
+        )
         launch.restype = ctypes.c_int
         self._launch = launch
+
+    def _resolve_dims(self) -> dict[str, int]:
+        """Map each symbolic dim name to a value from the input shapes.
+
+        Called after the inputs have been materialized; ``self._inputs`` holds
+        them in ``info.inputs`` order.  A name is the TIR var (e.g. ``M``);
+        every global buffer carries the same var for the same logical extent,
+        so the first buffer whose shape contains it decides.
+        """
+        found: dict[str, int] = {}
+        for arg, t in zip(self.info.inputs, self._inputs):
+            logical = tuple(t.shape)
+            for i, s in enumerate(arg.shape):
+                name = str(s)
+                if name in self.info.dyn_dims and name not in found:
+                    if i >= len(logical):
+                        raise ValueError(
+                            f"cannot resolve dim {name!r} from {arg.name} "
+                            f"tensor of shape {logical}")
+                    found[name] = int(logical[i])
+        missing = [n for n in self.info.dyn_dims if n not in found]
+        if missing:
+            raise ValueError(
+                f"unresolved dynamic dim(s) {missing} for kernel "
+                f"{self.kernel_name}; pass tensors whose shapes cover them")
+        return found
 
     def run(self, *inputs: torch.Tensor):
         """Run the kernel: H2D each input, allocate outputs, launch, D2H outputs.
@@ -1337,20 +1393,26 @@ class PPLGenericKernel(PPLKernel):
         to_free: list[int] = []
         out_tensors: dict[str, tuple[torch.Tensor, int]] = {}
         try:
-            for arg, t in zip(in_args, inputs):
-                t = t.detach().cpu().to(_TORCH_DTYPE[arg.torch_dtype]).contiguous()
+            casted = [t.detach().cpu().to(_TORCH_DTYPE[arg.torch_dtype]).contiguous()
+                      for arg, t in zip(in_args, inputs)]
+            self._inputs = casted
+            dims_by_name = self._resolve_dims()
+
+            for arg, t in zip(in_args, casted):
                 addr = self._h2d(t)
                 addr_by_name[arg.name] = addr
                 to_free.append(addr)
             for arg in self.info.outputs:
-                ot = torch.empty(tuple(arg.shape), dtype=_TORCH_DTYPE[arg.torch_dtype])
+                shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
+                ot = torch.empty(shape, dtype=_TORCH_DTYPE[arg.torch_dtype])
                 oaddr = self.lib.py_dev_malloc(ot.numel() * ot.element_size())
                 addr_by_name[arg.name] = oaddr
                 to_free.append(oaddr)
                 out_tensors[arg.name] = (ot, oaddr)
 
             addrs = [addr_by_name[a.name] for a in self.info.args]
-            if self._launch(self.handle, *addrs) != 0:
+            dims = [dims_by_name[n] for n in self.info.dyn_dims]
+            if self._launch(self.handle, *addrs, *dims) != 0:
                 raise RuntimeError(f"{self.kernel_name} launch failed")
             self.lib.py_sync_device(self.handle)
             for _name, (ot, oaddr) in out_tensors.items():
@@ -1358,6 +1420,7 @@ class PPLGenericKernel(PPLKernel):
         finally:
             for a in to_free:
                 self.lib.py_dev_free(a)
+            self._inputs = []
 
         outs = [out_tensors[a.name][0] for a in self.info.outputs]
         return outs[0] if len(outs) == 1 else tuple(outs)

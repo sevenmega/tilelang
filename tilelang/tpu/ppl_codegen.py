@@ -9,12 +9,23 @@ from the bounded op set below.
 Node vocabulary handled (verified against the lowered GEMM and head-major
 flash-attention TIR):
 
-  * grid ``thread_binding`` For axes (blockIdx.x/y/z)  -> C ``for`` loops
+  * grid ``thread_binding`` For axes (blockIdx.x/y/z).  Grid *arity* selects the
+    dispatch: a 2-axis grid (no core axis) becomes plain nested C ``for``
+    loops, while a 3-axis grid is multi-core -- the last axis is the core index,
+    emitted as ``get_block_index()`` behind a ``get_block_num()`` guard instead
+    of a loop, so the body runs once per core rather than serially on one core.
   * ``tl.tileop.copy``   -> ``dma::load`` / ``dma::store`` / ``tiu::cast`` / ``tiu::move``
   * ``tl.tileop.fill``   -> ``tiu::zero`` / ``tiu::fill``
   * ``tl.tileop.gemm``   -> ``tiu::fmm2`` (fp16 operands, fp32 accum; result_add = !clear_accum)
   * ``tl.tileop.reduce`` -> ``quick_pooling`` (mode 0=max / 1=sum; +combine when !clear)
-  * serial ``For``       -> inner C ``for`` loop
+  * serial ``For``       -> inner C ``for`` loop (``T.Pipelined`` lowers to a
+        plain serial For carrying a ``num_stages`` annotation, so it needs no
+        separate case -- pipelining is a no-op for this backend)
+  * ``Bind`` (eager-builder ``let``, e.g. ``bx_global = bc * M_tiles + bx``)
+        -> ``int <var> = <value>;`` at the current scope. ``Bind`` has no body;
+        the var is visible to all later statements in the same scope, which is
+        also C's rule for a declaration in a block.
+  * ``IfThenElse``       -> C ``if`` / ``else``
   * parallel ``For`` nest ending in a ``BufferStore`` -> ``tiu`` vector ops
         (``fadd``/``fsub``/``fmul``/``fmax``/``fmin``, scalar overloads,
          ``Div`` -> reciprocal + ``fmul``, ``exp`` -> ``exp_no_overflow``)
@@ -28,8 +39,11 @@ dim4 mapping (uniform, verified for 2D/3D/4D buffers):
     ``order = {0, 2, 1, 3}`` -- this puts the trailing-two buffer axes onto C/W.
     A region's offset/extent are padded the same way and reordered by ``order``.
 
-Shapes are baked as compile-time constants (concrete from the lowered TIR), one
-compile per shape; the emitted ``__KERNEL__`` takes only pointers.
+Dynamic shapes: any extent that is not a compile-time constant is emitted as a
+trailing ``int <name>_dim`` parameter on the ``__KERNEL__`` and aliased in-body
+as ``const int <name> = (int)<name>_dim;``, so every ``_render_index`` site works
+unchanged. One compile serves every shape; the runtime resolves the values from
+the input shapes at launch time. Constant extents stay folded as literals.
 """
 
 from __future__ import annotations
@@ -171,6 +185,26 @@ def _is_zero(e: Any) -> bool:
         return False
 
 
+def _collect_binds(node: Any) -> list[Any]:
+    """Collect every ``Bind`` statement in the kernel body (any nesting)."""
+    out: list[Any] = []
+    tn = type(node).__name__
+    if tn == "Bind":
+        out.append(node)
+        return out
+    if tn in ("For", "SBlock", "Block", "SBlockRealize", "BlockRealize"):
+        return _collect_binds(node.body)
+    if tn == "IfThenElse":
+        out += _collect_binds(node.then_case)
+        if getattr(node, "else_case", None) is not None:
+            out += _collect_binds(node.else_case)
+        return out
+    if tn == "SeqStmt":
+        for s in node.seq:
+            out += _collect_binds(s)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # region parsing                                                               #
 # --------------------------------------------------------------------------- #
@@ -211,6 +245,14 @@ class PPLEmitter:
         self.kernel_name = kernel_name
         self.lines: list[str] = []
         self._tmp = 0
+
+        # Grid dispatch state, populated by run(): the thread_binding axes, the
+        # core axis (last of a 3-axis grid), the kernel's Bind statements, and
+        # the recognized core partition (axis, per-core extent) if any.
+        self.grid: list[Any] = []
+        self.core_for: Any = None
+        self._binds: list[Any] = []
+        self.partition: tuple[Any, Any] | None = None
 
         # Classify buffers: globals (param buffer_map) vs locals (alloc_buffers).
         self.globals: dict[str, BufArg] = {}
@@ -383,6 +425,20 @@ class PPLEmitter:
             self.emit_stmt(node.body)
         elif tn == "BufferStore":
             self.emit_store(node)
+        elif tn == "Bind":
+            # eager-builder `let` (e.g. bx_global = bc * M_tiles_per_core + bx).
+            # Bind has no body; the var is visible to all later stmts in the same
+            # scope, so mirror that with a C declaration at the current indent.
+            #
+            # When the enclosing grid axis was narrowed to this core's slice
+            # (see _find_core_partition), the loop var already holds the global
+            # index, so the slice-origin arithmetic is a no-op and must be
+            # dropped -- keeping it would re-apply the offset and skip tiles.
+            rewritten = self.partition_bind_rewrite(node)
+            if rewritten is not None:
+                self.emit(f"int {node.var.name} = {rewritten};")
+            else:
+                self.emit(f"int {node.var.name} = {_render_index(node.value)};")
         elif tn == "IfThenElse":
             cond = _render_index(node.condition)
             self.emit(f"if ({cond}) {{")
@@ -654,6 +710,82 @@ class PPLEmitter:
 
     # -- top level --------------------------------------------------------- #
 
+    def partition_bind_rewrite(self, bind: Any) -> str | None:
+        """Render ``bind`` for a narrowed axis, or ``None`` to render normally.
+
+        For the recognized partition ``<bind var> = <core> * <per_core> + <axis>``
+        the narrowed loop already yields the global index, so the bind is just
+        the loop var. Any other expression in the same bind is left alone.
+        """
+        if self.partition is None:
+            return None
+        axis_for, _ = self.partition
+        val = bind.value
+        if type(val).__name__ != "Add":
+            return None
+        mul, axis_var = (val.a, val.b) if type(val.b).__name__ == "Var" else (val.b, val.a)
+        if type(axis_var).__name__ != "Var" or axis_var.name != axis_for.loop_var.name:
+            return None
+        return axis_var.name
+
+    def _find_core_partition(self) -> tuple[Any, Any] | None:
+        """Recover a core-partitioned grid axis from the kernel's ``Bind`` set.
+
+        A kernel that splits work across cores writes the slice origin as a
+        ``let``, e.g. ``bx_global = bc * M_tiles_per_core + bx`` where ``bc`` is
+        the core axis and ``M_tiles_per_core == ceildiv(M_tiles, core_num)``.
+        That means grid axis ``bx`` is *meant* to run over one core's share, but
+        the DSL records its extent as the whole tile count (``ceildiv(M,
+        block_M)``) -- the per-core trim is left to a body guard.
+
+        Emitting the grid axis at its full extent on every core therefore walks
+        the entire tile space 4x and lets the guard cut a different amount per
+        core, giving a 4:3:2:1 work staircase (even though every core is live).
+        The reference emitter for this kernel instead bounds each core to
+        ``tiles_per_core``, which is what makes the split even.
+
+        Returns ``(axis_for, per_core_extent)`` when the pattern is recognized,
+        else ``None``. Only a multiplier that *provably* equals
+        ``ceildiv(axis_extent, core_num)`` is accepted, so an unrecognized
+        partition is left exactly as written rather than silently rewritten.
+        """
+        if not self.core_for:
+            return None
+        core_name = self.core_for.loop_var.name
+        core_ext = self.core_for.extent
+        for bind in self._binds:
+            val = bind.value
+            if type(val).__name__ != "Add":
+                continue
+            mul, axis_var = (val.a, val.b) if type(val.b).__name__ == "Var" else (val.b, val.a)
+            if type(mul).__name__ != "Mul" or type(axis_var).__name__ != "Var":
+                continue
+            core_side, mult = (mul.a, mul.b) if type(mul.a).__name__ == "Var" else (mul.b, mul.a)
+            if type(core_side).__name__ != "Var" or core_side.name != core_name:
+                continue
+            axis = next((g for g in self.grid if g.loop_var.name == axis_var.name), None)
+            if axis is None:
+                continue
+            # Check multiplier == ceildiv(axis_extent, core_num) *by value*, not
+            # by text: the DSL's flooring shape (a-1)//b differs from the naive
+            # ceildiv form, so compare as expressions via the simplifier.
+            try:
+                want = _tir.ceildiv(axis.extent, core_ext)
+                if _tir.analysis.expr_deep_equal(want, mult):
+                    return axis, mult
+            except Exception:
+                continue
+            # The eager-builder folds ceildiv into FloorDiv-by-c; accept that
+            # exact shape too (extent + core - 1) // core.
+            tn = type(mult).__name__
+            if tn == "FloorDiv" and _render_index(mult.b) == _render_index(core_ext):
+                try:
+                    if _tir.analysis.expr_deep_equal(mult.a, axis.extent + core_ext - 1):
+                        return axis, mult
+                except Exception:
+                    continue
+        return None
+
     def _walk_to_kernel(self) -> tuple[list[Any], list[Any], Any]:
         """Return (grid_fors, alloc_buffers, body) from the lowered func body."""
         node = self.func.body
@@ -680,6 +812,9 @@ class PPLEmitter:
 
     def run(self) -> PPLKernelInfo:
         grid, allocs, body = self._walk_to_kernel()
+        self.grid = list(grid)
+        self.core_for = grid[-1] if len(grid) >= 3 else None
+        self._binds = _collect_binds(body)
 
         # kernel signature: pointer args, then one int per symbolic extent.
         # Dyn dims carry no C default: PPL binds this entry point by name and
@@ -697,12 +832,51 @@ class PPLEmitter:
         self.emit_dyn_dim_decls()
         self.emit_global_decls()
 
-        # grid loops
+        # Grid dispatch. SG2260E has 4 cores and PPL is SPMD: the kernel body
+        # runs once per core and each core must claim a slice. Emitting the grid
+        # axes as plain C loops instead runs the whole grid on *one* core, which
+        # is correct but 4x slower -- the profiler shows the other three cores
+        # idle. So a 3-axis grid (blockIdx.z == core count) is lowered to a
+        # get_block_index() slice rather than a loop.
+        multicore = self.core_for is not None
         indent_base = 2
+        if multicore:
+            core_for = self.core_for
+            core_var = core_for.loop_var.name
+            core_ext = _render_index(core_for.extent)
+            self.emit("set_block_num_max();", indent_base)
+            self.emit(f"const int {core_var} = get_block_index();", indent_base)
+            self.emit(f"if ({core_var} >= {core_ext}) return;", indent_base)
+            self.emit("{", indent_base)
+            indent_base += 1
+            grid = grid[:-1]
+
+        # A core-partitioned axis must be bounded to this core's share. If we
+        # emit it at its full extent instead, every core walks the whole tile
+        # space and only the body's guard trims the tail -- which cuts a
+        # different amount per core and yields a 4:3:2:1 staircase. The
+        # partition is only applied where it is provably what the kernel asked
+        # for (see _find_core_partition); otherwise the axis is emitted as-is.
+        partition = self._find_core_partition() if multicore else None
+        self.partition = partition
         for g in grid:
             var = g.loop_var.name
             ext = _render_index(g.extent)
-            self.emit(f"for (int {var} = 0; {var} < {ext}; {var}++) {{", indent_base)
+            if partition is not None and g is partition[0]:
+                per_core = _render_index(partition[1])
+                self.emit(
+                    f"int {var}_start = {core_var} * ({per_core});", indent_base
+                )
+                self.emit(
+                    f"int {var}_end = min({var}_start + ({per_core}), ({ext}));",
+                    indent_base,
+                )
+                self.emit(
+                    f"for (int {var} = {var}_start; {var} < {var}_end; {var}++) {{",
+                    indent_base,
+                )
+            else:
+                self.emit(f"for (int {var} = 0; {var} < {ext}; {var}++) {{", indent_base)
             indent_base += 1
 
         # NOTE: from here we rely on self.emit's default indent (1) for body
@@ -712,6 +886,9 @@ class PPLEmitter:
 
         # close grid loops
         for g in reversed(grid):
+            indent_base -= 1
+            self.emit("}", indent_base)
+        if multicore:
             indent_base -= 1
             self.emit("}", indent_base)
         self.lines.append("}")

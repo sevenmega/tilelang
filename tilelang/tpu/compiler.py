@@ -126,6 +126,9 @@ class TPUKernel:
             "max_record_num": max_record_num,
             "book_keeping": book_keeping,
             "dir": pd,
+            # Pinned here so collection can pick this device's dump out of the
+            # dir even if TPU_VISIBLE_DEVICES changes before collect_profile().
+            "device": self.device,
         }
         if self._runtime is not None:
             self._runtime.close()
@@ -138,7 +141,11 @@ class TPUKernel:
         if self._runtime is not None:
             self._runtime.close()
             self._runtime = None
-        return _collect_profile_data(self._profile_config["dir"], verbose=verbose)
+        return _collect_profile_data(
+            self._profile_config["dir"],
+            device=self._profile_config.get("device", self.device),
+            verbose=verbose,
+        )
 
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         return self.info.source

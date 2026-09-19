@@ -978,18 +978,60 @@ def _parse_summary(summary_path: str) -> float:
     return 0.0
 
 
-def _collect_profile_data(profiling_dir: str, *, verbose: bool = False) -> dict[str, Any]:
+def _select_cdm_dump(
+    profiling_dir: str, device: int | None, *,
+    verbose: bool = False,
+) -> list[str]:
+    """Pick the dump(s) in *profiling_dir* that belong to *device*.
+
+    The runtime names each dump after the device that produced it
+    (``cdm_profile_data_dev7-0``) and drops it in the cwd, which
+    ``_move_profile_data`` then sweeps into the profile dir.  Because that move
+    only replaces a dump of the *same* name, running a second profile session on
+    a different device leaves both behind -- and processing both yields two
+    summaries for what the user sees as one ``--profile`` run.  Selecting by
+    device id keeps that from happening.
+
+    Falls back to every dump found when *device* is ``None`` or matches nothing,
+    so an unexpected naming scheme still yields (possibly over-complete) data
+    rather than a hard failure.
+    """
+    import glob as _glob
+    import sys as _sys
+
+    all_dumps = sorted(_glob.glob(os.path.join(profiling_dir, "cdm_profile_data_dev*")))
+    if device is None or len(all_dumps) <= 1:
+        return all_dumps
+
+    want = os.path.join(profiling_dir, f"cdm_profile_data_dev{device}-*")
+    mine = sorted(_glob.glob(want))
+    if not mine:
+        if verbose:
+            print(
+                f"[ppl_runner] no dump for device {device}; "
+                f"falling back to all {len(all_dumps)} dump(s)",
+                file=_sys.stderr,
+            )
+        return all_dumps
+    return mine
+
+
+def _collect_profile_data(
+    profiling_dir: str, *, device: int | None = None, verbose: bool = False,
+) -> dict[str, Any]:
     """Process ``cdm_profile_data_dev*`` files with ``bigTpuProfile``.
+
+    Only dumps produced by *device* are processed (see
+    :func:`_select_cdm_dump`); pass ``device=None`` to process all of them.
 
     If ``bigTpuProfile`` fails (e.g. timestamp normalization errors), the raw
     ``cdm_profile_data_dev*`` files are still returned so the user can inspect
     or reprocess them manually.  A warning is printed instead of raising.
     """
-    import glob as _glob
     import sys as _sys
     import warnings as _warnings
 
-    cdm_files = sorted(_glob.glob(os.path.join(profiling_dir, "cdm_profile_data_dev*")))
+    cdm_files = _select_cdm_dump(profiling_dir, device, verbose=verbose)
     if not cdm_files:
         raise RuntimeError(f"No cdm_profile_data_dev* files found in {profiling_dir}")
 
@@ -1108,7 +1150,7 @@ def run_profiling(
     kernel.run(a, b)
     kernel.close()
 
-    return _collect_profile_data(profiling_dir, verbose=verbose)
+    return _collect_profile_data(profiling_dir, device=devid, verbose=verbose)
 
 
 # --------------------------------------------------------------------------- #
@@ -1272,7 +1314,9 @@ class PPLKernel:
         """Process ``cdm_profile_data_dev*`` files with ``bigTpuProfile``."""
         if not self._profile_dir:
             raise RuntimeError("Profiling not enabled — no profile_dir set")
-        return _collect_profile_data(self._profile_dir, verbose=verbose)
+        return _collect_profile_data(
+            self._profile_dir, device=self.device, verbose=verbose
+        )
 
     def _h2d(self, t: torch.Tensor) -> int:
         t = t.contiguous()

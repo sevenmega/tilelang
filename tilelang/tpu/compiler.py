@@ -23,9 +23,17 @@ from typing import Any
 import torch
 
 from tilelang.tpu.ppl_runner import (
-    PPLKernel, PPLGenericKernel, PPLGemmSpec, PPLKernelInfo, build, build_generic,
-    emit_pl, get_tpu_device, _collect_profile_data,
+    PPLKernel,
+    PPLGenericKernel,
+    PPLGemmSpec,
+    PPLKernelInfo,
+    build,
+    build_generic,
+    emit_pl,
+    get_tpu_device,
+    _collect_profile_data,
 )
+from tilelang.transform.lower_tpu_pipeline import lower_tpu_pipeline
 import logging
 
 logger = logging.getLogger(__name__)
@@ -194,6 +202,18 @@ def compile(
     # Accept either a PrimFunc or a callable producing one.
     if callable(func) and not hasattr(func, "buffer_map"):
         func = func()
+
+    # Real num_stages pipelining: rewrite the T.Pipelined loop into an explicit
+    # prologue / S-way-unrolled steady state / drain, multi-buffering the
+    # pipeline-stage locals so every buffer reference is a compile-time
+    # constant.  Must run before emit_pl; a no-op when the kernel has no loop
+    # tagged ``num_stages >= 2``.
+    #
+    # TILELANG_TPU_PIPELINE=0 restores the old behaviour (tag the loop and let
+    # PPL's implicit scheduler handle it), which is what the pass is measured
+    # against.
+    if os.environ.get("TILELANG_TPU_PIPELINE", "1") != "0":
+        func = lower_tpu_pipeline(func)
 
     info = emit_pl(func, out_idx=out_idx)
 

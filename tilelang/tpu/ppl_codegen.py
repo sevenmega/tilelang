@@ -462,6 +462,15 @@ class PPLEmitter:
                 self.emit(f"int {node.var.name} = {rewritten};")
             else:
                 self.emit(f"int {node.var.name} = {_render_index(node.value)};")
+        elif tn == "AttrStmt":
+            # Overlap markers emitted by LowerTpuPipeline (tilelang/transform/
+            # lower_tpu_pipeline.py).  The key *is* the call text, so this is
+            # how ``parallel_start()`` / ``parallel_end()`` reach the output.
+            key = str(node.attr_key)
+            if key.startswith("ppl::") and key.endswith("()"):
+                self.emit(f"{key[5:]};")
+            else:
+                self.emit_stmt(node.body)
         elif tn == "IfThenElse":
             cond = _render_index(node.condition)
             self.emit(f"if ({cond}) {{")

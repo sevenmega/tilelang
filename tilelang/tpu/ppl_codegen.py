@@ -18,9 +18,11 @@ flash-attention TIR):
   * ``tl.tileop.fill``   -> ``tiu::zero`` / ``tiu::fill``
   * ``tl.tileop.gemm``   -> ``tiu::fmm2`` (fp16 operands, fp32 accum; result_add = !clear_accum)
   * ``tl.tileop.reduce`` -> ``quick_pooling`` (mode 0=max / 1=sum; +combine when !clear)
-  * serial ``For``       -> inner C ``for`` loop (``T.Pipelined`` lowers to a
-        plain serial For carrying a ``num_stages`` annotation, so it needs no
-        separate case -- pipelining is a no-op for this backend)
+  * serial ``For``       -> inner C ``for`` loop.  A ``num_stages`` annotation
+        (i.e. the loop came from ``T.Pipelined``) additionally emits
+        ``enable_pipeline()`` as the loop body's first statement, handing the
+        double/triple-buffering and load/compute overlap to the PPL compiler.
+        A plain ``T.serial`` loop gets no hint and runs straight through.
   * ``Bind`` (eager-builder ``let``, e.g. ``bx_global = bc * M_tiles + bx``)
         -> ``int <var> = <value>;`` at the current scope. ``Bind`` has no body;
         the var is visible to all later statements in the same scope, which is
@@ -183,6 +185,27 @@ def _is_zero(e: Any) -> bool:
         return int(e) == 0
     except (TypeError, ValueError):
         return False
+
+
+def _num_stages(node: Any) -> int | None:
+    """Return a ``For``'s ``num_stages`` annotation, or ``None`` if absent.
+
+    ``T.Pipelined(n, num_stages=k)`` lowers to a plain serial ``For`` whose
+    ``annotations`` carry ``num_stages``; a plain ``T.serial`` loop has no such
+    tag.  This is the only signal distinguishing "please double/triple-buffer
+    this loop" from "run it straight through", so it is what gates
+    ``enable_pipeline()``.
+    """
+    ann = getattr(node, "annotations", None)
+    if not ann:
+        return None
+    val = ann.get("num_stages")
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _collect_binds(node: Any) -> list[Any]:
@@ -576,6 +599,14 @@ class PPLEmitter:
             var = node.loop_var.name
             ext = _render_index(node.extent)
             self.emit(f"for (int {var} = 0; {var} < {ext}; {var}++) {{")
+            # ``T.Pipelined`` lowers to a plain serial For tagged with
+            # num_stages; the tag itself is all we need, since PPL's
+            # ``enable_pipeline()`` performs the multi-buffering and
+            # load/compute overlap in the compiler.  It is a *hint* on the
+            # loop, so it must be the first statement in the body -- and it
+            # takes no depth argument, matching the PPL examples.
+            if _num_stages(node) is not None:
+                self.emit("enable_pipeline();")
             self.emit_stmt(node.body)
             self.emit("}")
         else:

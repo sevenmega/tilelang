@@ -23,6 +23,7 @@ Only the fp16 -> fp32-accum -> (relu) -> fp16 path is verified end-to-end today.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -90,6 +91,38 @@ def _resolve_chip_arch(ppl_root: str, chip: str) -> str:
     if chip in _CHIP_MAP_CACHE.values():
         return chip
     raise ValueError(f"Unknown chip '{chip}'; known: {list(_CHIP_MAP_CACHE.keys())}")
+
+
+@contextlib.contextmanager
+def _scoped_chip_env(keys: tuple[str, ...]):
+    """Snapshot *keys* and restore them exactly — including unset — on exit.
+
+    The rest of ``_setup_ppl_env`` mutates the host process env so the
+    ``ppl-compile`` / ``cmake`` **subprocesses** inherit it, but ``CHIP`` /
+    ``CHIP_ARCH`` are also read *in-process* by the device runtime:
+    ``ppl_get_arch_info()`` (ppltensor.h) does a strcmp over arch NAMES and
+    treats ``CHIP_ARCH`` as authoritative, falling back to ``CHIP``.  The build
+    needs the chip CODE (``tpub_7_1_e``) there, the runtime needs the arch NAME
+    (``sg2260e``).  Writing the code in and left in place poisons every
+    subsequent device op — an in-forward kernel build therefore made the next
+    op (``o_proj``) throw ``Unsupported CHIP: tpub_7_1_e``.  Both subprocess
+    paths already receive the code explicitly (``ppl-compile --chip``,
+    ``cmake -DCHIP``), so the mutation only has to live as far as process
+    spawn: scoping it here stops the leak at its source.
+
+    ``clear()`` (not ``set(default)``) is used when a key was originally
+    unset, so a faithful restore never fabricates a value the caller must not
+    see — ``ppl_get_arch_info()`` rejects an empty string outright.
+    """
+    saved = {k: (k in os.environ, os.environ.get(k)) for k in keys}
+    try:
+        yield
+    finally:
+        for k, (was_set, value) in saved.items():
+            if was_set:
+                os.environ[k] = value
+            else:
+                os.environ.pop(k, None)
 
 
 def _setup_ppl_env(
@@ -883,13 +916,17 @@ def _build_common(
 
     compiler_bin = os.path.join(ppl_root, "bin", "ppl-compile")
     if os.path.isfile(compiler_bin):
-        _setup_ppl_env(ppl_root, chip, chip_arch, workdir, kernel_name)
-        _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
-                         autotune=True, verbose=verbose)
-        _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
+        # The build sets CHIP/CHIP_ARCH to the chip CODE; scope that so it does
+        # not outlive the build and poison the runtime's arch-name lookup.
+        with _scoped_chip_env(("CHIP", "CHIP_ARCH")):
+            _setup_ppl_env(ppl_root, chip, chip_arch, workdir, kernel_name)
+            _run_ppl_compile(ppl_root, pl_path, chip_arch, workdir, opt=opt, rv=True,
+                             autotune=True, verbose=verbose)
+            _cmake_build(ppl_root, chip_arch, workdir, mode="pcie", verbose=verbose)
     else:
         logger.warning("[TPU]: ppl-compile binary not found, falling back to ppl_compile.py subprocess")
-        _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, opt, verbose)
+        with _scoped_chip_env(("CHIP", "CHIP_ARCH")):
+            _build_via_ppl_compile_py(ppl_root, pl_path, workdir, chip, opt, verbose)
 
     if not os.path.isfile(kernel_so):
         raise RuntimeError(f"libkernel.so not produced at {kernel_so}")
@@ -1427,7 +1464,7 @@ class PPLGenericKernel(PPLKernel):
         non-output params).  Returns the single output tensor, or a tuple when
         the kernel declares multiple outputs.
         """
-        logger.warning("[TPU]: PPLGenericKernel->run()")
+        # logger.warning("[TPU]: PPLGenericKernel->run()")
         in_args = self.info.inputs
         if len(inputs) != len(in_args):
             raise ValueError(

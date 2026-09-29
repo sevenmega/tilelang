@@ -23,7 +23,7 @@ Without ``--run`` it only emits + prints the kernel source (compile smoke test).
 
 import sys
 
-from tilelang.tpu.kernels.attention import flash_attention_gqa
+from tilelang.tpu.kernels.attention_v1_static import flash_attention_gqa
 
 # Qwen3-0.6B attention head config; tile-aligned prefill shapes.
 B, SQ, SKV = 1, 8, 128
@@ -65,10 +65,9 @@ def _ref_attention(q, k, v, mask, scale):
 
 
 def main():
-    # Dynamic-shape kernel: only D (head dim) is baked; B/Hq/Sq/Hkv/Skv are
-    # resolved at call time from the input shapes. Calling the jit factory
-    # (lazy mode) returns the compiled kernel.
-    kernel = flash_attention_gqa(d=D, sm_scale=SCALE)
+    kernel = flash_attention_gqa.compile(
+        B=B, Sq=SQ, Skv=SKV, Hq=HQ, Hkv=HKV, D=D,
+    )
     print("\nTPU flash-attention kernel source:")
     print(kernel.get_kernel_source())
     print("\nFlash-attention compilation for TPU target succeeded.")

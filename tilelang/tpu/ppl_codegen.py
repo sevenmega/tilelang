@@ -162,6 +162,13 @@ def _render_index(e: Any) -> str:
             return str(e)
     if tn == "Not":
         return f"(!{_render_index(e.a)})"
+    if tn in ("Min", "Max"):
+        # Clamped extents/offsets (``min(base + tile, extent)``) are ordinary C
+        # expressions, not tile ops -- they appear in loop bounds and sub_view
+        # shapes, which are emitted as raw text.  ``_emit_binary`` handles the
+        # elementwise tile form (``tiu::fmin``/``tiu::fmax``); this is its
+        # scalar sibling.
+        return f"{tn.lower()}({_render_index(e.a)}, {_render_index(e.b)})"
     if tn in _BIN_OP:
         return f"({_render_index(e.a)} {_BIN_OP[tn]} {_render_index(e.b)})"
     # Fall back to the TVM printer (e.g. constant-folded scalars).

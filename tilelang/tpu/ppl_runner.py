@@ -1444,12 +1444,23 @@ class PPLGenericKernel(PPLKernel):
             logical = tuple(t.shape)
             for i, s in enumerate(arg.shape):
                 name = str(s)
-                if name in self.info.dyn_dims and name not in found:
-                    if i >= len(logical):
-                        raise ValueError(
-                            f"cannot resolve dim {name!r} from {arg.name} "
-                            f"tensor of shape {logical}")
-                    found[name] = int(logical[i])
+                if name not in self.info.dyn_dims:
+                    continue
+                if i >= len(logical):
+                    raise ValueError(
+                        f"cannot resolve dim {name!r} from {arg.name} "
+                        f"tensor of shape {logical}")
+                val = int(logical[i])
+                # A symbolic name may recur across buffers (e.g. B in both Q and
+                # K); every occurrence must agree, else the caller passed
+                # inconsistent shapes and first-buffer-wins would silently pick
+                # one. Fail loudly instead.
+                if name in found and found[name] != val:
+                    raise ValueError(
+                        f"dynamic dim {name!r} has conflicting values "
+                        f"{found[name]} and {val} across input buffers for "
+                        f"kernel {self.kernel_name}; check the input shapes")
+                found[name] = val
         missing = [n for n in self.info.dyn_dims if n not in found]
         if missing:
             raise ValueError(

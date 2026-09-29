@@ -190,8 +190,16 @@ def compile(
 
     Walks the lowered TIR op-by-op (:func:`tilelang.tpu.ppl_runner.emit_pl` ->
     :mod:`tilelang.tpu.ppl_codegen`), builds the ``.pl`` with the PPL toolchain,
-    and returns a callable :class:`TPUKernel`.  Shapes are baked from the TIR
-    (one compile per shape); the emitted ``__KERNEL__`` takes only pointers.
+    and returns a callable :class:`TPUKernel`.
+
+    Shapes may be **baked** (concrete extents in the TIR — one build per shape) or
+    **dynamic**: any buffer dimension declared with ``T.dynamic`` stays symbolic in
+    ``buffer_map``, is emitted as a trailing ``int`` runtime argument of the PPL
+    ``__KERNEL__``, and is resolved per call from the input tensors' shapes. On-chip
+    tile extents must always be concrete (``emit_local_allocs`` bakes them to ints),
+    so tile sizes / head-dim style dims stay baked while batch / sequence / head
+    counts can be dynamic. A single dynamic build then serves every shape whose
+    tiles divide evenly.
 
     Compilation is device-agnostic — the device ID is resolved at runtime from
     ``$TPU_VISIBLE_DEVICES`` when the kernel is first called.

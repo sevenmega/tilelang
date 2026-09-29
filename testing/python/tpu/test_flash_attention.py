@@ -19,6 +19,12 @@ Run on real hardware under the PPL env (see the ``ppl-tpu-run-recipe`` memo):
     python testing/python/tpu/test_flash_attention.py --run
 
 Without ``--run`` it only emits + prints the kernel source (compile smoke test).
+
+Add ``--profile`` to enable hardware profiling of the run (implies ``--run``);
+``--verbose`` forwards to ``bigTpuProfile`` for per-op detail.  Same convention
+as the GEMM tests (``test_gemm_naive_tpu.py`` / ``test_gemm_v1_dyn_shape_tpu.py``):
+
+    python testing/python/tpu/test_flash_attention.py --run --profile [--verbose]
 """
 
 import sys
@@ -73,7 +79,11 @@ def main():
     print(kernel.get_kernel_source())
     print("\nFlash-attention compilation for TPU target succeeded.")
 
-    if "--run" not in sys.argv:
+    do_profile = "--profile" in sys.argv
+    do_verbose = "--verbose" in sys.argv
+
+    # --profile implies --run: profiling a kernel that never executed is moot.
+    if "--run" not in sys.argv and not do_profile:
         return
 
     import torch
@@ -85,9 +95,17 @@ def main():
     mask2d = _build_causal_mask(SQ, SKV)  # [Sq, Skv]
     mask = mask2d.unsqueeze(0).expand(B, SQ, SKV).contiguous()  # [B, Sq, Skv]
 
+    # Profiling must be armed before the first launch; the dump is collected
+    # after the run below (same as the GEMM tests).
+    if do_profile:
+        kernel.adapter.enable_profile()
+
     out = kernel(q, k, v, mask)  # [B, Hq, Sq, D] fp16
     out = out.float()
     ref = _ref_attention(q, k, v, mask, SCALE)
+
+    if do_profile:
+        kernel.adapter.collect_profile(verbose=do_verbose)
 
     diff = (out - ref).abs()
     rel = (diff.norm() / ref.norm().clamp_min(1e-6)).item()

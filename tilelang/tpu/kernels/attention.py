@@ -91,15 +91,20 @@ def flash_attention_gqa(
         groups = Hq // Hkv
 
         # Flatten (batch, query-tile) into one work axis and split it across cores.
-        # ``bx`` is a *per-core* index; ``bc`` is the core. The emitter narrows the
-        # leading axis to ``tiles_per_core`` when it recognizes this partition
-        # (``bx_g = bc * tiles_per_core + bx``), otherwise every core sweeps the
-        # full range and the extent guard below makes that redundant-but-correct.
+        # The axis carries the FULL work count and ``tiles_per_core`` is exactly
+        # ``ceildiv(total_tiles, num_cores)`` -- that is the shape the emitter
+        # recognizes as a core partition, and only then does it narrow each core to
+        # ``[bc*tiles_per_core, +tiles_per_core)``.  A core whose range starts past
+        # ``total_tiles`` gets an *empty* loop, so it never enters the body (and so
+        # never pays for the local-tile descriptor setup below).  Putting the
+        # already-divided extent on the axis instead makes the recognition fail and
+        # every core sweep a non-empty range -- correct, but idle cores then cost
+        # ~65us of dead descriptor setup, which dominates small shapes.
         Tq = T.ceildiv(Sq, block_M)
         total_tiles = B * Tq
         tiles_per_core = T.ceildiv(total_tiles, _NUM_CORES)
 
-        with T.Kernel(tiles_per_core, Hq, _NUM_CORES) as (bx, by, bc):
+        with T.Kernel(total_tiles, Hq, _NUM_CORES) as (bx, by, bc):
             Q_local = T.alloc_local((block_M, D), dtype)
             K_local = T.alloc_local((block_N, D), dtype)
             V_local = T.alloc_local((block_N, D), dtype)
@@ -114,7 +119,8 @@ def flash_attention_gqa(
             logsum = T.alloc_local((block_M,), accum_dtype)
 
             bx_global = bc * tiles_per_core + bx
-            # Guard the whole tile: a padded grid would otherwise index past B.
+            # Guard for the un-narrowed fallback; with the partition recognized the
+            # loop bound already clamps, so this never rejects.
             with T.If(bx_global < total_tiles), T.Then():
                 b = bx_global // Tq
                 tq = bx_global % Tq

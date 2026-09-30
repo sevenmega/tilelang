@@ -32,6 +32,20 @@ contribute nothing; padded query rows produce throwaway output the caller slices
 off).  This is why the sglang path still pads host-side even though the kernel is
 shape-generic — padding to a block multiple is a single compiled kernel, not one
 build per bucket.
+
+Grid / core mapping
+-------------------
+``B`` must **not** be its own grid axis: the emitter treats the *last* grid axis
+as the core index (``ppl_codegen`` lowers a 3-axis ``T.Kernel`` to
+``get_block_index()`` + a guard), and SG2260E has only ``num_cores`` of them.  A
+trailing ``B`` axis therefore silently caps the computed batch at ``num_cores``
+and leaves the rest of ``Out`` unwritten.  Instead the ``(batch, query-tile)``
+pair is flattened into the leading axis, ``total_tiles = B * ceildiv(Sq, block_M)``,
+and split across cores; the last axis is ``num_cores`` and the body recovers
+``b``/``tq`` from the work index.  The extent guard keeps the kernel correct even
+when the emitter does not recognize the per-core partition (it then falls back to
+every core sweeping the full range, which duplicates writes of identical values
+rather than dropping any).
 """
 
 import tilelang
@@ -45,6 +59,10 @@ Sq = T.dynamic("Sq", "int32")
 Skv = T.dynamic("Skv", "int32")
 Hq = T.dynamic("Hq", "int32")
 Hkv = T.dynamic("Hkv", "int32")
+
+# SG2260E has four cores; the last grid axis is the core index (see the module
+# docstring's "Grid / core mapping"). Baked, like the tile sizes.
+_NUM_CORES = 4
 
 
 @tilelang.jit(target="tpu")
@@ -72,7 +90,16 @@ def flash_attention_gqa(
         _, Hkv, Skv, _ = K.shape
         groups = Hq // Hkv
 
-        with T.Kernel(T.ceildiv(Sq, block_M), Hq, B) as (bx, by, bz):
+        # Flatten (batch, query-tile) into one work axis and split it across cores.
+        # ``bx`` is a *per-core* index; ``bc`` is the core. The emitter narrows the
+        # leading axis to ``tiles_per_core`` when it recognizes this partition
+        # (``bx_g = bc * tiles_per_core + bx``), otherwise every core sweeps the
+        # full range and the extent guard below makes that redundant-but-correct.
+        Tq = T.ceildiv(Sq, block_M)
+        total_tiles = B * Tq
+        tiles_per_core = T.ceildiv(total_tiles, _NUM_CORES)
+
+        with T.Kernel(tiles_per_core, Hq, _NUM_CORES) as (bx, by, bc):
             Q_local = T.alloc_local((block_M, D), dtype)
             K_local = T.alloc_local((block_N, D), dtype)
             V_local = T.alloc_local((block_N, D), dtype)
@@ -86,38 +113,44 @@ def flash_attention_gqa(
             row_sum = T.alloc_local((block_M,), accum_dtype)
             logsum = T.alloc_local((block_M,), accum_dtype)
 
-            T.copy(Q[bz, by, bx * block_M, 0], Q_local)
-            T.fill(acc_o, 0)
-            T.fill(logsum, 0)
-            T.fill(m_cur, -30000.0)
+            bx_global = bc * tiles_per_core + bx
+            # Guard the whole tile: a padded grid would otherwise index past B.
+            with T.If(bx_global < total_tiles), T.Then():
+                b = bx_global // Tq
+                tq = bx_global % Tq
 
-            for k in T.serial(T.ceildiv(Skv, block_N)):
-                T.copy(K[bz, by // groups, k * block_N, 0], K_local)
-                T.copy(V[bz, by // groups, k * block_N, 0], V_local)
-                T.copy(Mask[bz, bx * block_M, k * block_N], Mask_local)
-                # S = Q @ K^T  (overwrite acc_s: fresh scores each kv block)
-                T.gemm(Q_local, K_local, acc_s, transpose_B=True, clear_accum=True)
-                # scale + additive mask
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = acc_s[i, j] * scale + Mask_local[i, j]
-                # online softmax running max
-                T.copy(m_cur, m_prev)
-                T.reduce_max(acc_s, m_cur, dim=1, clear=False)
-                for i in T.Parallel(block_M):
-                    scale_f[i] = T.exp(m_prev[i] - m_cur[i])
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.exp(acc_s[i, j] - m_cur[i])
-                T.reduce_sum(acc_s, row_sum, dim=1)
-                for i in T.Parallel(block_M):
-                    logsum[i] = logsum[i] * scale_f[i] + row_sum[i]
+                T.copy(Q[b, by, tq * block_M, 0], Q_local)
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(m_cur, -30000.0)
+
+                for k in T.serial(T.ceildiv(Skv, block_N)):
+                    T.copy(K[b, by // groups, k * block_N, 0], K_local)
+                    T.copy(V[b, by // groups, k * block_N, 0], V_local)
+                    T.copy(Mask[b, tq * block_M, k * block_N], Mask_local)
+                    # S = Q @ K^T  (overwrite acc_s: fresh scores each kv block)
+                    T.gemm(Q_local, K_local, acc_s, transpose_B=True, clear_accum=True)
+                    # scale + additive mask
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = acc_s[i, j] * scale + Mask_local[i, j]
+                    # online softmax running max
+                    T.copy(m_cur, m_prev)
+                    T.reduce_max(acc_s, m_cur, dim=1, clear=False)
+                    for i in T.Parallel(block_M):
+                        scale_f[i] = T.exp(m_prev[i] - m_cur[i])
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.exp(acc_s[i, j] - m_cur[i])
+                    T.reduce_sum(acc_s, row_sum, dim=1)
+                    for i in T.Parallel(block_M):
+                        logsum[i] = logsum[i] * scale_f[i] + row_sum[i]
+                    for i, j in T.Parallel(block_M, D):
+                        acc_o[i, j] = acc_o[i, j] * scale_f[i]
+                    # O += P @ V  (accumulate across kv blocks)
+                    T.copy(acc_s, acc_s_cast)
+                    T.gemm(acc_s_cast, V_local, acc_o)
+
                 for i, j in T.Parallel(block_M, D):
-                    acc_o[i, j] = acc_o[i, j] * scale_f[i]
-                # O += P @ V  (accumulate across kv blocks)
-                T.copy(acc_s, acc_s_cast)
-                T.gemm(acc_s_cast, V_local, acc_o)
-
-            for i, j in T.Parallel(block_M, D):
-                acc_o[i, j] = acc_o[i, j] / logsum[i]
-            T.copy(acc_o, Out[bz, by, bx * block_M, 0])
+                    acc_o[i, j] = acc_o[i, j] / logsum[i]
+                T.copy(acc_o, Out[b, by, tq * block_M, 0])
 
     return main

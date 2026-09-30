@@ -134,7 +134,7 @@ def main():
     _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
 
     # 2. Qwen3-0.6B attention head config; tile-aligned prefill shapes, batched.
-    B, SQ, SKV, HQ, HKV = 4, 256, 256, 16, 8
+    B, SQ, SKV, HQ, HKV = 32, 256, 256, 16, 8
     _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
 
     # 3. Qwen3-0.6B attention head config; tile-aligned decode shapes, B=1.
@@ -142,7 +142,7 @@ def main():
     _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
 
     # 4. Qwen3-0.6B attention head config; tile-aligned decode shapes, batched.
-    B, SQ, SKV, HQ, HKV = 4, 1, 384, 16, 8
+    B, SQ, SKV, HQ, HKV = 32, 1, 384, 16, 8
     _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
 
 if __name__ == "__main__":

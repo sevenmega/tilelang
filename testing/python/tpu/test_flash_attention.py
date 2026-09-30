@@ -31,12 +31,7 @@ import sys
 
 from tilelang.tpu.kernels.attention import flash_attention_gqa
 
-# Qwen3-0.6B attention head config; tile-aligned prefill shapes.
-B, SQ, SKV = 1, 8, 128
-HQ, HKV, D = 16, 8, 128
-SCALE = float(D) ** -0.5  # 1/sqrt(d) — matches the kernel's default sm_scale
 MASK_NEG = -30000.0  # fp16-safe stand-in for -inf
-
 
 def _build_causal_mask(sq, skv):
     import torch
@@ -69,23 +64,7 @@ def _ref_attention(q, k, v, mask, scale):
             out[bi, h, :, :] = p @ vi
     return out
 
-
-def main():
-    # Dynamic-shape kernel: only D (head dim) is baked; B/Hq/Sq/Hkv/Skv are
-    # resolved at call time from the input shapes. Calling the jit factory
-    # (lazy mode) returns the compiled kernel.
-    kernel = flash_attention_gqa(d=D, sm_scale=SCALE)
-    print("\nTPU flash-attention kernel source:")
-    print(kernel.get_kernel_source())
-    print("\nFlash-attention compilation for TPU target succeeded.")
-
-    do_profile = "--profile" in sys.argv
-    do_verbose = "--verbose" in sys.argv
-
-    # --profile implies --run: profiling a kernel that never executed is moot.
-    if "--run" not in sys.argv and not do_profile:
-        return
-
+def _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose):
     import torch
 
     torch.manual_seed(0)
@@ -123,5 +102,49 @@ def main():
         sys.exit(1)
 
 
+def main():
+    D= 128
+    SCALE = float(D) ** -0.5  # 1/sqrt(d) — matches the kernel's default sm_scale
+
+    # Dynamic-shape kernel: only D (head dim) is baked; B/Hq/Sq/Hkv/Skv are
+    # resolved at call time from the input shapes. Calling the jit factory
+    # (lazy mode) returns the compiled kernel.
+    kernel = flash_attention_gqa(d=D, sm_scale=SCALE)
+
+    print("func_source:")
+    print(flash_attention_gqa.func_source)
+    print("signature:")
+    print(flash_attention_gqa.signature)
+    print("TIR:")
+    print(flash_attention_gqa.get_tir().script())
+
+    print("\nTPU flash-attention kernel source:")
+    print(kernel.get_kernel_source())
+    print("\nFlash-attention compilation for TPU target succeeded.")
+
+    do_profile = "--profile" in sys.argv
+    do_verbose = "--verbose" in sys.argv
+
+    # --profile implies --run: profiling a kernel that never executed is moot.
+    if "--run" not in sys.argv and not do_profile:
+        return
+
+    # 1. Qwen3-0.6B attention head config; tile-aligned prefill shapes, B=1.
+    B, SQ, SKV, HQ, HKV = 1, 8, 128, 16, 8
+    _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
+
+    # 2. Qwen3-0.6B attention head config; tile-aligned prefill shapes, batched.
+    B, SQ, SKV, HQ, HKV = 4, 256, 256, 16, 8
+    _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
+
+    # 3. Qwen3-0.6B attention head config; tile-aligned decode shapes, B=1.
+    B, SQ, SKV, HQ, HKV = 1, 1, 384, 16, 8
+    _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
+
+    # 4. Qwen3-0.6B attention head config; tile-aligned decode shapes, batched.
+    B, SQ, SKV, HQ, HKV = 4, 1, 384, 16, 8
+    _run_test(kernel, B, SQ, SKV, HQ, HKV, D, SCALE, do_profile, do_verbose)
+
 if __name__ == "__main__":
     main()
+

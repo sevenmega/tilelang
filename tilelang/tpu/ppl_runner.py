@@ -1517,3 +1517,50 @@ class PPLGenericKernel(PPLKernel):
         outs = [out_tensors[a.name][0] for a in self.info.outputs]
         return outs[0] if len(outs) == 1 else tuple(outs)
 
+    def run_device_ptrs(
+        self,
+        input_addrs: list[int],
+        dims_by_name: dict[str, int],
+        output_addrs: list[int],
+    ) -> None:
+        """Launch the kernel using pre-supplied device addresses, no H2D/D2H.
+
+        ``input_addrs`` and ``output_addrs`` are raw device pointers in the
+        order of ``info.inputs`` and ``info.outputs`` respectively.  The caller
+        owns all allocation and must synchronize after calling this method.
+
+        ``dims_by_name`` maps every symbolic dim name (as declared with
+        ``T.dynamic``) to its concrete integer value for this invocation; see
+        :meth:`_resolve_dims` for how the host-tensor path derives the same map.
+
+        This is the device-pointer fast path: tensors that already live on the
+        TPU can be passed directly without any host memcpy, which is critical
+        for kernels that process large paged KV caches.
+        """
+        if len(input_addrs) != len(self.info.inputs):
+            raise ValueError(
+                f"{self.kernel_name} expects {len(self.info.inputs)} input "
+                f"addresses, got {len(input_addrs)}"
+            )
+        if len(output_addrs) != len(self.info.outputs):
+            raise ValueError(
+                f"{self.kernel_name} expects {len(self.info.outputs)} output "
+                f"addresses, got {len(output_addrs)}"
+            )
+        missing = [n for n in self.info.dyn_dims if n not in dims_by_name]
+        if missing:
+            raise ValueError(
+                f"unresolved dynamic dim(s) {missing} for kernel "
+                f"{self.kernel_name}; pass them in dims_by_name"
+            )
+        # Build the ordered address list: args = inputs + outputs in PrimFunc order.
+        addr_by_name: dict[str, int] = {}
+        for arg, addr in zip(self.info.inputs, input_addrs):
+            addr_by_name[arg.name] = addr
+        for arg, addr in zip(self.info.outputs, output_addrs):
+            addr_by_name[arg.name] = addr
+        addrs = [addr_by_name[a.name] for a in self.info.args]
+        dims = [dims_by_name[n] for n in self.info.dyn_dims]
+        if self._launch(self.handle, *addrs, *dims) != 0:
+            raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
+

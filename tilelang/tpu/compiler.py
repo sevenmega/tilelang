@@ -115,6 +115,77 @@ class TPUKernel:
             self.close()
             return self._ensure_runtime().run(*casted)
 
+    def call_device(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Launch the kernel with on-device tensors, skipping all H2D/D2H copies.
+
+        ``inputs`` are device tensors (one per non-output PrimFunc param, in
+        order) whose ``.data_ptr()`` values are passed directly to the kernel
+        as raw device addresses.  The output tensor is allocated on-device via
+        ``torch.empty(..., device=tpu_device)`` so it stays on the TPU and is
+        returned as a normal device tensor — no H2D or D2H memcpy for any
+        argument.
+
+        All inputs must already be contiguous and in the correct dtype.
+        ``_sync_rt_device()`` must still be called by the caller (as usual)
+        before invoking this method so the PPL runtime's current-device pointer
+        stays consistent with torch_tpu's current device.
+        """
+        import ctypes as _ctypes
+        from tilelang.tpu.ppl_runner import _TORCH_DTYPE, _concrete_dim
+
+        rt = self._ensure_runtime()
+        info = self.info
+
+        in_args = info.inputs
+        if len(inputs) != len(in_args):
+            raise ValueError(
+                f"{info.kernel_name} expects {len(in_args)} device inputs, "
+                f"got {len(inputs)}"
+            )
+
+        # Resolve dynamic dims from the device input tensor shapes.
+        dims_by_name: dict[str, int] = {}
+        for arg, t in zip(in_args, inputs):
+            for i, s in enumerate(arg.shape):
+                name = str(s)
+                if name not in info.dyn_dims:
+                    continue
+                val = int(t.shape[i])
+                if name in dims_by_name and dims_by_name[name] != val:
+                    raise ValueError(
+                        f"dynamic dim {name!r} has conflicting values "
+                        f"{dims_by_name[name]} and {val} across device inputs"
+                    )
+                dims_by_name[name] = val
+        missing = [n for n in info.dyn_dims if n not in dims_by_name]
+        if missing:
+            raise ValueError(
+                f"unresolved dynamic dim(s) {missing}; check input tensor shapes"
+            )
+
+        # Allocate output(s) on the TPU device using torch_tpu's allocator.
+        # This puts the result in the same device VA space as the inputs; the
+        # kernel writes directly to this tensor's storage with no memcpy.
+        tpu_device = f"tpu:{self.device}"
+        out_tensors: list[torch.Tensor] = []
+        for arg in info.outputs:
+            shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
+            dtype = _TORCH_DTYPE[arg.torch_dtype]
+            out_tensors.append(torch.empty(shape, dtype=dtype, device=tpu_device))
+
+        input_addrs = [int(t.data_ptr()) for t in inputs]
+        output_addrs = [int(t.data_ptr()) for t in out_tensors]
+        rt.run_device_ptrs(input_addrs, dims_by_name, output_addrs)
+        # The caller owns synchronization; we do not sync here so the caller
+        # can overlap work with the kernel execution if needed.  For the
+        # typical single-launch use in _attend_flash_batch, the caller's
+        # _sync_rt_device() was already called pre-launch and the result is
+        # available after py_sync_device — but we leave that to the caller
+        # to match the existing _attend_flash convention.
+        rt.lib.py_sync_device(rt.handle)
+
+        return out_tensors[0] if len(out_tensors) == 1 else tuple(out_tensors)
+
     def enable_profile(
         self,
         *,

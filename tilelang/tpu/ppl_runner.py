@@ -46,6 +46,42 @@ _TORCH_DTYPE = {
     "float32": torch.float32,
 }
 
+# ctypes handle to tpuRtSetDevice, resolved lazily. None = not yet tried,
+# False = tried and unavailable (don't retry).
+_TPURT_SET_DEVICE: Any = None
+
+
+def _reassert_tpu_device(device: int) -> None:
+    """Re-point the PPL runtime's current device at ``device`` before a launch.
+
+    Any torch_tpu device-tensor op (e.g. allocating the kernel's output with
+    ``torch.empty(..., device='tpu')``) silently moves the runtime's notion of
+    the current device, after which a kernel launch dies with
+    "stream and device mismatch!".  The device-pointer launch path allocates its
+    output *after* the caller's sync, so it must re-assert here, immediately
+    before the launch.  A no-op if the runtime symbol is unavailable.
+    """
+    global _TPURT_SET_DEVICE
+    if _TPURT_SET_DEVICE is None:
+        try:
+            # The runtime is already mapped by torch_tpu; CDLL(None) searches the
+            # global symbol namespace without re-opening the .so by path.
+            lib = ctypes.CDLL(None, mode=ctypes.RTLD_GLOBAL)
+            fn = lib.tpuRtSetDevice
+            fn.argtypes = [ctypes.c_int]
+            fn.restype = ctypes.c_int
+            _TPURT_SET_DEVICE = fn
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[TPU] cannot re-assert the PPL runtime device (%s); "
+                "device-pointer launches may fail after a torch_tpu op.",
+                exc,
+            )
+            _TPURT_SET_DEVICE = False
+    if _TPURT_SET_DEVICE:
+        _TPURT_SET_DEVICE(int(device))
+
+
 
 # --------------------------------------------------------------------------- #
 # PPL root resolution                                                          #
@@ -1561,6 +1597,9 @@ class PPLGenericKernel(PPLKernel):
             addr_by_name[arg.name] = addr
         addrs = [addr_by_name[a.name] for a in self.info.args]
         dims = [dims_by_name[n] for n in self.info.dyn_dims]
+        # The caller allocated the output via torch_tpu after its own device
+        # sync, which desyncs the runtime; re-assert immediately before launch.
+        _reassert_tpu_device(self.device)
         if self._launch(self.handle, *addrs, *dims) != 0:
             raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
 

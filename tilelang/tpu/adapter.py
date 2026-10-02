@@ -84,6 +84,14 @@ class PPLKernelAdapter:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.func(*args, **kwargs)
 
+    def call_device(self, *inputs: Any) -> Any:
+        """Forward to :meth:`TPUKernel.call_device` (device-pointer fast path).
+
+        Callers hold a JITKernel/adapter, not the underlying TPUKernel, so this
+        forward is what makes the no-copy launch reachable from the model.
+        """
+        return self._tpu_kernel.call_device(*inputs)
+
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         return self._tpu_kernel.get_kernel_source(kernel_only=kernel_only)
 

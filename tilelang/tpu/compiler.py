@@ -104,48 +104,66 @@ class TPUKernel:
             self._runtime = rt
         return self._runtime
 
-    def __call__(self, *inputs: torch.Tensor):
-        casted = [t.detach().cpu().contiguous() for t in inputs]
-        self._last_inputs = casted
+    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Launch the kernel with on-device tensors (the only supported ABI).
+
+        ``inputs`` are device tensors, one per non-output PrimFunc param in
+        order; their ``.data_ptr()`` values are passed straight to the kernel as
+        raw device addresses.  Any output the caller does not supply is
+        allocated on the device, and the result is returned as a device tensor.
+        Nothing is copied through host memory.
+
+        The optional trailing form ``kernel(*inputs, *outputs)`` writes into
+        caller-owned output tensors — the caller's storage is used directly, so
+        there is no second allocation and no ``copy_``.  That form is what the
+        adapter's write-into mode maps onto.
+
+        CPU tensors are rejected: the host-marshalling path was removed so that
+        a caller cannot silently get a slow, copying launch.  Move inputs to the
+        device (``t.to(f"tpu:{device}")``) instead.
+        """
+        in_args = self.info.inputs
+        n_in = len(in_args)
+        n_out = len(self.info.outputs)
+        if not (n_in <= len(inputs) <= n_in + n_out):
+            raise ValueError(
+                f"{self.info.kernel_name} expects {n_in} inputs (plus up to "
+                f"{n_out} preallocated outputs), got {len(inputs)}"
+            )
+        device_inputs = list(inputs[:n_in])
+        provided_outputs = list(inputs[n_in:])
+
+        for t in device_inputs:
+            if t.device.type != "tpu":
+                raise ValueError(
+                    f"{self.info.kernel_name}: inputs must be TPU device "
+                    f"tensors (the host-marshalling path was removed); got a "
+                    f"tensor on '{t.device.type}'"
+                )
+
+        self._last_inputs = device_inputs
         try:
-            return self._ensure_runtime().run(*casted)
+            return self._launch_device(device_inputs, provided_outputs)
         except (RuntimeError, OSError):
             # Device handle may be stale (e.g. invalidated by another config's
             # py_init_device during autotuning).  Reinitialize and retry once.
             self.close()
-            return self._ensure_runtime().run(*casted)
+            return self._launch_device(device_inputs, provided_outputs)
 
-    def call_device(self, *inputs: torch.Tensor) -> torch.Tensor:
-        """Launch the kernel with on-device tensors, skipping all H2D/D2H copies.
-
-        ``inputs`` are device tensors (one per non-output PrimFunc param, in
-        order) whose ``.data_ptr()`` values are passed directly to the kernel
-        as raw device addresses.  The output tensor is allocated on-device via
-        ``torch.empty(..., device=tpu_device)`` so it stays on the TPU and is
-        returned as a normal device tensor — no H2D or D2H memcpy for any
-        argument.
-
-        All inputs must already be contiguous and in the correct dtype.
-        ``_sync_rt_device()`` must still be called by the caller (as usual)
-        before invoking this method so the PPL runtime's current-device pointer
-        stays consistent with torch_tpu's current device.
-        """
-        import ctypes as _ctypes
+    def _launch_device(
+        self,
+        inputs: list[torch.Tensor],
+        provided_outputs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Resolve dims, allocate any missing outputs on-device, then launch."""
         from tilelang.tpu.ppl_runner import _TORCH_DTYPE, _concrete_dim
 
         rt = self._ensure_runtime()
         info = self.info
 
-        in_args = info.inputs
-        if len(inputs) != len(in_args):
-            raise ValueError(
-                f"{info.kernel_name} expects {len(in_args)} device inputs, "
-                f"got {len(inputs)}"
-            )
-
         # Resolve dynamic dims from the device input tensor shapes.
         dims_by_name: dict[str, int] = {}
-        for arg, t in zip(in_args, inputs):
+        for arg, t in zip(info.inputs, inputs):
             for i, s in enumerate(arg.shape):
                 name = str(s)
                 if name not in info.dyn_dims:
@@ -163,25 +181,32 @@ class TPUKernel:
                 f"unresolved dynamic dim(s) {missing}; check input tensor shapes"
             )
 
-        # Allocate output(s) on the TPU device using torch_tpu's allocator.
-        # This puts the result in the same device VA space as the inputs; the
-        # kernel writes directly to this tensor's storage with no memcpy.
+        # Use caller-supplied outputs where given; allocate the rest on the TPU
+        # with torch_tpu's allocator (same VA space as the inputs, so the kernel
+        # writes directly into this storage).
         tpu_device = f"tpu:{self.device}"
         out_tensors: list[torch.Tensor] = []
-        for arg in info.outputs:
-            shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
-            dtype = _TORCH_DTYPE[arg.torch_dtype]
-            out_tensors.append(torch.empty(shape, dtype=dtype, device=tpu_device))
+        for i, arg in enumerate(info.outputs):
+            if i < len(provided_outputs):
+                out = provided_outputs[i]
+                if out.device.type != "tpu":
+                    raise ValueError(
+                        f"{info.kernel_name}: preallocated output {i} must be a "
+                        f"TPU device tensor; got '{out.device.type}'"
+                    )
+                out_tensors.append(out)
+            else:
+                shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
+                dtype = _TORCH_DTYPE[arg.torch_dtype]
+                out_tensors.append(
+                    torch.empty(shape, dtype=dtype, device=tpu_device)
+                )
 
         input_addrs = [int(t.data_ptr()) for t in inputs]
         output_addrs = [int(t.data_ptr()) for t in out_tensors]
         rt.run_device_ptrs(input_addrs, dims_by_name, output_addrs)
-        # The caller owns synchronization; we do not sync here so the caller
-        # can overlap work with the kernel execution if needed.  For the
-        # typical single-launch use in _attend_flash_batch, the caller's
-        # _sync_rt_device() was already called pre-launch and the result is
-        # available after py_sync_device — but we leave that to the caller
-        # to match the existing _attend_flash convention.
+        # run_device_ptrs re-asserts the runtime's current device immediately
+        # before the launch, so no caller-side _sync_rt_device is needed.
         rt.lib.py_sync_device(rt.handle)
 
         return out_tensors[0] if len(out_tensors) == 1 else tuple(out_tensors)
@@ -337,8 +362,18 @@ class TPUGemmKernel:
         return self._runtime
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        a = a.detach().cpu().contiguous()
-        b = b.detach().cpu().contiguous()
+        """Launch with device tensors (the only supported ABI).
+
+        The legacy host marshalling (``.cpu()`` + H2D) was removed together with
+        the generic path's; both now hand raw device addresses to the kernel.
+        """
+        for t in (a, b):
+            if t.device.type != "tpu":
+                raise ValueError(
+                    f"{self.spec.kernel_name}: inputs must be TPU device "
+                    f"tensors (the host-marshalling path was removed); got a "
+                    f"tensor on '{t.device.type}'"
+                )
         self._a, self._b = a, b
         try:
             return self._ensure_runtime().run(a, b)

@@ -68,6 +68,9 @@ if __name__ == "__main__":
     import sys
     if "--run" in sys.argv:
         import torch
+        from tilelang.tpu.ppl_runner import ensure_tpu_device
+
+        DEV = f"tpu:{ensure_tpu_device()}"
         do_profile = "--profile" in sys.argv
         if do_profile:
             kernel.adapter.enable_profile()
@@ -80,20 +83,22 @@ if __name__ == "__main__":
 
         for M_val, N_val, K_val in test_shapes:
             print(f"\n--- Testing M={M_val}, N={N_val}, K={K_val} ---")
-            a = torch.randn(M_val, K_val, dtype=torch.float16)
-            b = torch.randn(K_val, N_val, dtype=torch.float16)
-            c = torch.empty(M_val, N_val, dtype=torch.float32)
+            a = torch.randn(M_val, K_val, dtype=torch.float16, device=DEV)
+            b = torch.randn(K_val, N_val, dtype=torch.float16, device=DEV)
+            c = torch.empty(M_val, N_val, dtype=torch.float32, device=DEV)
             kernel(a, b, c)
-            # float16 by default, change to float32 for comparison
-            c_ref = torch.relu(a @ b).to(dtype=torch.float32)
+            # Reference is computed on the CPU: on-device torch matmul is not a
+            # valid oracle on this target.  Only the comparison moves off-device.
+            c_ref = torch.relu(a.cpu() @ b.cpu()).to(dtype=torch.float32)
+            c_host = c.cpu()
 
             # torch.testing.assert_close(c, c_ref, rtol=1e-2, atol=1e-2)
-            if torch.allclose(c, c_ref, rtol=1e-2, atol=1e-2):
+            if torch.allclose(c_host, c_ref, rtol=1e-2, atol=1e-2):
                 print("PASS: TPU result matches torch reference")
             else:
-                max_diff = (c - c_ref).abs().max().item()
+                max_diff = (c_host - c_ref).abs().max().item()
                 print(f"FAIL: max diff = {max_diff}")
-                print(c)
+                print(c_host)
                 print(c_ref)
                 sys.exit(1)
 

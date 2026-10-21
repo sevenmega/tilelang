@@ -57,21 +57,26 @@ if __name__ == "__main__":
     import sys
     if "--run" in sys.argv:
         import torch
+        from tilelang.tpu.ppl_runner import ensure_tpu_device
+
+        DEV = f"tpu:{ensure_tpu_device()}"
         do_profile = "--profile" in sys.argv
         if do_profile:
             kernel.adapter.enable_profile()
 
-        a = torch.randn(M, K, dtype=torch.float16)
-        b = torch.randn(K, N, dtype=torch.float16)
+        a = torch.randn(M, K, dtype=torch.float16, device=DEV)
+        b = torch.randn(K, N, dtype=torch.float16, device=DEV)
         # c = matmul_naive(a, b)
         c = kernel(a, b)
-        c_ref = torch.relu(a.float() @ b.float()).half()
+        # Reference on CPU: on-device torch matmul is not a valid oracle.
+        c_ref = torch.relu(a.cpu().float() @ b.cpu().float()).half()
+        c_host = c.cpu()
 
         # torch.testing.assert_close(c, c_ref, rtol=1e-2, atol=1e-2)
-        if torch.allclose(c, c_ref, rtol=1e-2, atol=1e-2):
+        if torch.allclose(c_host, c_ref, rtol=1e-2, atol=1e-2):
             print("PASS: TPU result matches torch reference")
         else:
-            max_diff = (c - c_ref).abs().max().item()
+            max_diff = (c_host - c_ref).abs().max().item()
             print(f"FAIL: max diff = {max_diff}")
             sys.exit(1)
 

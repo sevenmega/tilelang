@@ -29,9 +29,9 @@ Because tile extents are baked and *not* clamped to partial tiles, ``Sq`` must b
 multiple of ``block_M`` and ``Skv`` a multiple of ``block_N``; callers pad up to
 those multiples (padded key columns get a ``-30000`` additive mask so they
 contribute nothing; padded query rows produce throwaway output the caller slices
-off).  This is why the sglang path still pads host-side even though the kernel is
+off).  This is why the sglang path still pads even though the kernel is
 shape-generic — padding to a block multiple is a single compiled kernel, not one
-build per bucket.
+build per bucket.  The padding is done on-device, in the kernel's own dtype.
 
 Grid / core mapping
 -------------------
@@ -68,8 +68,8 @@ _NUM_CORES = 4
 @tilelang.jit(target="tpu")
 def flash_attention_gqa(
     d: int = 128,
-    block_M: int = 8,
-    block_N: int = 128,
+    block_M: int = 64,
+    block_N: int = 256,
     sm_scale: float | None = None,
     dtype: T.dtype = T.float16,
     accum_dtype: T.dtype = T.float32,

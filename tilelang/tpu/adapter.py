@@ -43,7 +43,8 @@ class PPLKernelAdapter:
 
         if len(args) == n_inputs:
             # Auto-allocate mode: kernel(*inputs) — only inputs provided.
-            # Run the kernel and return the result, cast to declared dtype.
+            # The kernel allocates output(s) on-device; cast the result to the
+            # declared dtype (already a device tensor — no host round trip).
             inputs: list[Any] = []
             ins_idx = 0
             for i in range(n_params):
@@ -58,10 +59,10 @@ class PPLKernelAdapter:
             return result
 
         if len(args) == n_params:
-            # Write-into mode: kernel(*inputs, *outputs) — all params including
-            # pre-allocated output tensor(s).  Run the kernel with the input
-            # tensors, then copy the result(s) into the caller's output
-            # tensor(s) (handles dtype conversion via copy_()).
+            # Write-into mode: kernel(*inputs, *outputs) — the caller's output
+            # tensor(s) ARE the kernel's output storage.  Forward them into the
+            # launch so the kernel writes directly into caller memory: no second
+            # allocation, no copy_.
             inputs = []
             outputs = []
             for i in range(n_params):
@@ -69,10 +70,7 @@ class PPLKernelAdapter:
                     outputs.append(args[i])
                 else:
                     inputs.append(args[i])
-            result = self._tpu_kernel(*inputs)
-            results = list(result) if isinstance(result, tuple) else [result]
-            for out, res in zip(outputs, results):
-                out.copy_(res)
+            self._tpu_kernel(*inputs, *outputs)
             return None
 
         raise ValueError(
@@ -83,14 +81,6 @@ class PPLKernelAdapter:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.func(*args, **kwargs)
-
-    def call_device(self, *inputs: Any) -> Any:
-        """Forward to :meth:`TPUKernel.call_device` (device-pointer fast path).
-
-        Callers hold a JITKernel/adapter, not the underlying TPUKernel, so this
-        forward is what makes the no-copy launch reachable from the model.
-        """
-        return self._tpu_kernel.call_device(*inputs)
 
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         return self._tpu_kernel.get_kernel_source(kernel_only=kernel_only)

@@ -82,6 +82,27 @@ def _reassert_tpu_device(device: int) -> None:
         _TPURT_SET_DEVICE(int(device))
 
 
+def _sync_torch_stream(device: int) -> None:
+    """Order the caller's torch_tpu writes before the PPL launch.
+
+    ``torch_tpu`` enqueues its ops (``randn``, ``ones``, ``fill_``, slice
+    assignments, ``copy_``) on *its own* stream.  The PPL wrapper launches on a
+    separate stream created inside ``py_init_device``.  Nothing orders the two,
+    so without a sync the kernel can read input buffers while the writes that
+    filled them are still in flight -- the kernel then computes on uninitialized
+    (typically zero) memory and the caller sees zeros, denormals, or NaN.
+
+    This is a no-op when torch_tpu is not in use, so host-only tooling is
+    unaffected.
+    """
+    try:
+        import torch
+
+        torch.get_device_module(f"tpu:{int(device)}").synchronize()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[TPU] cannot sync the torch_tpu stream (%s)", exc)
+
+
 
 # --------------------------------------------------------------------------- #
 # PPL root resolution                                                          #
@@ -94,6 +115,21 @@ def get_tpu_device() -> int:
         return int(val.split(",")[0])
     except (ValueError, IndexError):
         return 0
+
+
+def ensure_tpu_device() -> int:
+    """Register the ``"tpu"`` torch device, then return the device index.
+
+    ``torch.randn(..., device="tpu:0")`` raises "Expected one of cpu, cuda,
+    ..." until ``torch_tpu`` has been imported -- that import is what
+    registers the privateuseone backend under the name ``tpu``.  Tests and
+    scripts that build device tensors before touching a kernel must call this
+    first; kernel calls themselves work without it only because they allocate
+    outputs after the runtime is already initialized.
+    """
+    import torch_tpu  # noqa: F401  (registers the "tpu" device type)
+
+    return get_tpu_device()
 
 
 def _get_ppl_root() -> str:
@@ -1342,6 +1378,10 @@ class PPLKernel:
     def close(self) -> None:
         if self.handle:
             if self._profile_active:
+                # py_disable_profile launches an sg_api_set_profile kernel; a
+                # torch_tpu op since the last launch desyncs the runtime device,
+                # so re-assert before the launch (see _reassert_tpu_device).
+                _reassert_tpu_device(self.device)
                 self.lib.py_disable_profile(self.handle)
                 self._profile_active = False
                 self._move_profile_data()
@@ -1378,6 +1418,9 @@ class PPLKernel:
         if max_record_num <= 0:
             env_val = os.environ.get("PROFILE_RECORD_SIZE", "")
             max_record_num = int(env_val) if env_val else 131072
+        # py_enable_profile launches an sg_api_set_profile kernel; re-assert the
+        # runtime device first (a torch_tpu op may have desynced it).
+        _reassert_tpu_device(self.device)
         ret = self.lib.py_enable_profile(self.handle, max_record_num, book_keeping)
         if ret != 0:
             raise RuntimeError(f"tpudnnEnableProfile failed with code {ret}")
@@ -1391,36 +1434,27 @@ class PPLKernel:
             self._profile_dir, device=self.device, verbose=verbose
         )
 
-    def _h2d(self, t: torch.Tensor) -> int:
-        t = t.contiguous()
-        addr = self.lib.py_dev_malloc(t.numel() * t.element_size())
-        self.lib.py_memcpy_h2d(addr, ctypes.c_void_p(t.data_ptr()), t.numel() * t.element_size())
-        return addr
-
-    def _d2h(self, addr: int, t: torch.Tensor) -> None:
-        t = t.contiguous()
-        self.lib.py_memcpy_d2h(ctypes.c_void_p(t.data_ptr()), addr, t.numel() * t.element_size())
-
     def run(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """{fp16|bf16} [M,K] x [K,N] -> [M,N] (with ReLU if compiled with relu)."""
+        """{fp16|bf16} [M,K] x [K,N] -> [M,N] (with ReLU if compiled with relu).
+
+        Device-pointer launch: ``a`` and ``b`` must be TPU device tensors.  The
+        output is allocated on the device and written in place by the kernel;
+        nothing crosses host memory.
+        """
         logger.warning("[TPU]: PPLKernel->run()")
         assert a.dtype in (torch.float16, torch.bfloat16) and a.dtype == b.dtype
         M, K = a.shape
         K2, N = b.shape
         assert K == K2
-        a_addr = self._h2d(a)
-        b_addr = self._h2d(b)
-        c = torch.empty((M, N), dtype=a.dtype)
-        c_addr = self.lib.py_dev_malloc(c.numel() * c.element_size())
-        try:
-            if self._launch(self.handle, c_addr, a_addr, b_addr, M, K, N) != 0:
-                raise RuntimeError("kernel launch failed")
-            self.lib.py_sync_device(self.handle)
-            self._d2h(c_addr, c)
-        finally:
-            self.lib.py_dev_free(a_addr)
-            self.lib.py_dev_free(b_addr)
-            self.lib.py_dev_free(c_addr)
+        c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+        c_addr = int(c.data_ptr())
+        a_addr = int(a.data_ptr())
+        b_addr = int(b.data_ptr())
+        _reassert_tpu_device(self.device)
+        _sync_torch_stream(self.device)
+        if self._launch(self.handle, c_addr, a_addr, b_addr, M, K, N) != 0:
+            raise RuntimeError("kernel launch failed")
+        self.lib.py_sync_device(self.handle)
         return c
 
 
@@ -1439,7 +1473,7 @@ def _concrete_dim(s: Any, dims_by_name: dict[str, int]) -> int:
 class PPLGenericKernel(PPLKernel):
     """ctypes handle to a translator-generated PPL kernel on TPU.
 
-    Reuses :class:`PPLKernel`'s device management (init/close/h2d/d2h/profile),
+    Reuses :class:`PPLKernel`'s device management (init/close/profile),
     but binds the launch signature and ``run`` generically from a
     :class:`~tilelang.tpu.ppl_codegen.PPLKernelInfo`: N pointer arguments in
     PrimFunc param order (inputs + pre-allocated outputs), followed by one
@@ -1505,53 +1539,61 @@ class PPLGenericKernel(PPLKernel):
         return found
 
     def run(self, *inputs: torch.Tensor):
-        """Run the kernel: H2D each input, allocate outputs, launch, D2H outputs.
+        """Launch with device tensors; allocate outputs on-device, no H2D/D2H.
 
-        ``inputs`` are CPU torch tensors in the order of ``info.inputs`` (the
+        ``inputs`` are TPU device tensors in the order of ``info.inputs`` (the
         non-output params).  Returns the single output tensor, or a tuple when
-        the kernel declares multiple outputs.
+        the kernel declares multiple outputs — always device tensors.
+
+        This is a thin wrapper over :meth:`run_device_ptrs`: it resolves the
+        dynamic dims from the input shapes, allocates any output the caller did
+        not supply with torch_tpu's allocator, and hands raw device addresses to
+        the kernel.  Nothing is copied through host memory.
         """
-        # logger.warning("[TPU]: PPLGenericKernel->run()")
         in_args = self.info.inputs
-        if len(inputs) != len(in_args):
+        if not (len(in_args) <= len(inputs) <= len(in_args) + len(self.info.outputs)):
             raise ValueError(
-                f"{self.kernel_name} expects {len(in_args)} inputs, got {len(inputs)}")
+                f"{self.kernel_name} expects {len(in_args)} inputs (plus up to "
+                f"{len(self.info.outputs)} preallocated outputs), got {len(inputs)}"
+            )
+        device_inputs = list(inputs[: len(in_args)])
+        provided = list(inputs[len(in_args) :])
 
-        addr_by_name: dict[str, int] = {}
-        to_free: list[int] = []
-        out_tensors: dict[str, tuple[torch.Tensor, int]] = {}
+        for t in device_inputs:
+            if t.device.type != "tpu":
+                raise ValueError(
+                    f"{self.kernel_name}: inputs must be TPU device tensors "
+                    f"(the host-marshalling path was removed); got "
+                    f"'{t.device.type}'"
+                )
+
+        self._inputs = device_inputs
         try:
-            casted = [t.detach().cpu().to(_TORCH_DTYPE[arg.torch_dtype]).contiguous()
-                      for arg, t in zip(in_args, inputs)]
-            self._inputs = casted
             dims_by_name = self._resolve_dims()
-
-            for arg, t in zip(in_args, casted):
-                addr = self._h2d(t)
-                addr_by_name[arg.name] = addr
-                to_free.append(addr)
-            for arg in self.info.outputs:
-                shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
-                ot = torch.empty(shape, dtype=_TORCH_DTYPE[arg.torch_dtype])
-                oaddr = self.lib.py_dev_malloc(ot.numel() * ot.element_size())
-                addr_by_name[arg.name] = oaddr
-                to_free.append(oaddr)
-                out_tensors[arg.name] = (ot, oaddr)
-
-            addrs = [addr_by_name[a.name] for a in self.info.args]
-            dims = [dims_by_name[n] for n in self.info.dyn_dims]
-            if self._launch(self.handle, *addrs, *dims) != 0:
-                raise RuntimeError(f"{self.kernel_name} launch failed")
+            tpu_device = f"tpu:{self.device}"
+            out_tensors: list[torch.Tensor] = []
+            for i, arg in enumerate(self.info.outputs):
+                if i < len(provided):
+                    out_tensors.append(provided[i])
+                else:
+                    shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
+                    out_tensors.append(
+                        torch.empty(
+                            shape,
+                            dtype=_TORCH_DTYPE[arg.torch_dtype],
+                            device=tpu_device,
+                        )
+                    )
+            self.run_device_ptrs(
+                [int(t.data_ptr()) for t in device_inputs],
+                dims_by_name,
+                [int(t.data_ptr()) for t in out_tensors],
+            )
             self.lib.py_sync_device(self.handle)
-            for _name, (ot, oaddr) in out_tensors.items():
-                self._d2h(oaddr, ot)
         finally:
-            for a in to_free:
-                self.lib.py_dev_free(a)
             self._inputs = []
 
-        outs = [out_tensors[a.name][0] for a in self.info.outputs]
-        return outs[0] if len(outs) == 1 else tuple(outs)
+        return out_tensors[0] if len(out_tensors) == 1 else tuple(out_tensors)
 
     def run_device_ptrs(
         self,
@@ -1599,7 +1641,10 @@ class PPLGenericKernel(PPLKernel):
         dims = [dims_by_name[n] for n in self.info.dyn_dims]
         # The caller allocated the output via torch_tpu after its own device
         # sync, which desyncs the runtime; re-assert immediately before launch.
+        # Also drain torch_tpu's stream: the caller's writes to these buffers
+        # were enqueued there, and the PPL launch runs on a different stream.
         _reassert_tpu_device(self.device)
+        _sync_torch_stream(self.device)
         if self._launch(self.handle, *addrs, *dims) != 0:
             raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
 

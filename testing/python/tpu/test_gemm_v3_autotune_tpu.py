@@ -17,7 +17,11 @@ def get_configs():
 
 def ref_program(A, B):
     import torch
-    return torch.relu(A @ B).to(dtype=torch.float32)
+
+    # Reference on CPU: on-device torch matmul is not a valid oracle on this
+    # target, so the comparison moves off-device.  A and B arrive as device
+    # tensors now that device pointers are the only launch ABI.
+    return torch.relu(A.cpu().float() @ B.cpu().float()).to(dtype=torch.float32)
 
 
 @tilelang.autotune(configs=get_configs(), ref_prog=ref_program)
@@ -61,10 +65,13 @@ if __name__ == "__main__":
     import sys
     import torch
 
+    from tilelang.tpu.ppl_runner import ensure_tpu_device
+
+    DEV = f"tpu:{ensure_tpu_device()}"
     M_val, N_val, K_val = 1024, 1024, 1024
 
-    a = torch.randn(M_val, K_val, dtype=torch.float16)
-    b = torch.randn(K_val, N_val, dtype=torch.float16)
+    a = torch.randn(M_val, K_val, dtype=torch.float16, device=DEV)
+    b = torch.randn(K_val, N_val, dtype=torch.float16, device=DEV)
 
     print(f"Autotuning GEMM+ReLU for M={M_val}, N={N_val}, K={K_val} ...")
     print(f"Search space: {len(get_configs())} configs")

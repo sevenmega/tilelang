@@ -77,16 +77,20 @@ def main():
 
     import torch
 
-    torch.manual_seed(0)
-    q = torch.randn(B, HQ, SQ, D, dtype=torch.float16)
-    k = torch.randn(B, HKV, SKV, D, dtype=torch.float16)
-    v = torch.randn(B, HKV, SKV, D, dtype=torch.float16)
-    mask2d = _build_causal_mask(SQ, SKV)  # [Sq, Skv]
-    mask = mask2d.unsqueeze(0).expand(B, SQ, SKV).contiguous()  # [B, Sq, Skv]
+    from tilelang.tpu.ppl_runner import ensure_tpu_device
 
-    out = kernel(q, k, v, mask)  # [B, Hq, Sq, D] fp16
-    out = out.float()
-    ref = _ref_attention(q, k, v, mask, SCALE)
+    dev = f"tpu:{ensure_tpu_device()}"
+    torch.manual_seed(0)
+    q = torch.randn(B, HQ, SQ, D, dtype=torch.float16, device=dev)
+    k = torch.randn(B, HKV, SKV, D, dtype=torch.float16, device=dev)
+    v = torch.randn(B, HKV, SKV, D, dtype=torch.float16, device=dev)
+    mask2d = _build_causal_mask(SQ, SKV)  # [Sq, Skv] (host)
+    mask = mask2d.unsqueeze(0).expand(B, SQ, SKV).contiguous().to(dev)
+
+    out = kernel(q, k, v, mask)  # [B, Hq, Sq, D] fp16, on device
+    # CPU reference (on-device matmul is not a valid oracle here).
+    out = out.float().cpu()
+    ref = _ref_attention(q.cpu(), k.cpu(), v.cpu(), mask.cpu(), SCALE)
 
     diff = (out - ref).abs()
     rel = (diff.norm() / ref.norm().clamp_min(1e-6)).item()

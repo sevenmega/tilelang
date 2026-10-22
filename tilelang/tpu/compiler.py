@@ -31,6 +31,7 @@ from tilelang.tpu.ppl_runner import (
     build_generic,
     emit_pl,
     get_tpu_device,
+    get_torch_device,
     _collect_profile_data,
 )
 from tilelang.transform.lower_tpu_pipeline import lower_tpu_pipeline
@@ -183,8 +184,10 @@ class TPUKernel:
 
         # Use caller-supplied outputs where given; allocate the rest on the TPU
         # with torch_tpu's allocator (same VA space as the inputs, so the kernel
-        # writes directly into this storage).
-        tpu_device = f"tpu:{self.device}"
+        # writes directly into this storage).  This is torch_tpu's *logical*
+        # device id -- `self.device` is the PPL runtime's physical id, and
+        # torch_tpu maps one to the other.
+        tpu_device = f"tpu:{get_torch_device()}"
         out_tensors: list[torch.Tensor] = []
         for i, arg in enumerate(info.outputs):
             if i < len(provided_outputs):

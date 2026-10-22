@@ -46,6 +46,9 @@ _TORCH_DTYPE = {
     "float32": torch.float32,
 }
 
+# ctypes handle to tpuRtGetDevice, resolved lazily. None = not yet tried,
+# False = tried and unavailable (don't retry).
+_TPURT_GET_DEVICE: Any = None
 # ctypes handle to tpuRtSetDevice, resolved lazily. None = not yet tried,
 # False = tried and unavailable (don't retry).
 _TPURT_SET_DEVICE: Any = None
@@ -82,7 +85,7 @@ def _reassert_tpu_device(device: int) -> None:
         _TPURT_SET_DEVICE(int(device))
 
 
-def _sync_torch_stream(device: int) -> None:
+def _sync_torch_stream() -> None:
     """Order the caller's torch_tpu writes before the PPL launch.
 
     ``torch_tpu`` enqueues its ops (``randn``, ``ones``, ``fill_``, slice
@@ -92,13 +95,14 @@ def _sync_torch_stream(device: int) -> None:
     filled them are still in flight -- the kernel then computes on uninitialized
     (typically zero) memory and the caller sees zeros, denormals, or NaN.
 
-    This is a no-op when torch_tpu is not in use, so host-only tooling is
-    unaffected.
+    Syncs torch_tpu's own current (logical) device: that is where the buffers
+    actually live, and it is not the PPL runtime's physical id.  A no-op when
+    torch_tpu is not in use, so host-only tooling is unaffected.
     """
     try:
         import torch
 
-        torch.get_device_module(f"tpu:{int(device)}").synchronize()
+        torch.get_device_module("tpu").synchronize()
     except Exception as exc:  # noqa: BLE001
         logger.debug("[TPU] cannot sync the torch_tpu stream (%s)", exc)
 
@@ -108,8 +112,21 @@ def _sync_torch_stream(device: int) -> None:
 # PPL root resolution                                                          #
 # --------------------------------------------------------------------------- #
 
-def get_tpu_device() -> int:
-    """Return the TPU device ID from ``$TPU_VISIBLE_DEVICES`` (default 0)."""
+def get_torch_device() -> int:
+    """Return torch_tpu's *logical* device index (default 0).
+
+    This is the index tensors are allocated on (``device="tpu:N"``) and the one
+    ``torch.tpu.set_device`` selects.  It is **not** the index the PPL runtime
+    wants: torch_tpu maps logical ids onto a different set of physical chips
+    (e.g. logical 7 -> physical 4), see :func:`get_tpu_device`.
+    """
+    try:
+        import torch
+
+        mod = getattr(torch, "tpu", None) or torch.get_device_module("tpu")
+        return int(mod.current_device())
+    except Exception:  # noqa: BLE001  (torch_tpu not imported / not available)
+        pass
     val = os.environ.get("TPU_VISIBLE_DEVICES", "0")
     try:
         return int(val.split(",")[0])
@@ -117,8 +134,57 @@ def get_tpu_device() -> int:
         return 0
 
 
+def get_tpu_device() -> int:
+    """Return the **physical** device index the PPL runtime should bind to.
+
+    ``torch_tpu`` and the PPL runtime disagree about device numbering:
+    ``torch.tpu.set_device(7)`` binds torch to logical 7, but the runtime's own
+    ``tpuGetDevice`` reports 4 -- torch_tpu maps logical ids onto physical chips
+    through its chip table.  Handing the logical id to ``tpuRtSetDevice`` bound
+    the wrapper's stream to the wrong chip, so a launch with a ``tpu:7`` tensor
+    died with "stream and device mismatch" and the output stayed zero.
+
+    So this returns the runtime's *physical* id, read after torch_tpu has been
+    initialized (its first allocation or ``set_device`` publishes the mapping).
+    Falls back to ``$TPU_VISIBLE_DEVICES`` (default 0) without torch_tpu.
+    """
+    try:
+        import torch  # noqa: F401
+        import torch_tpu  # noqa: F401  (maps the runtime and its symbols)
+
+        torch.tpu.current_device()  # force lazy init: publishes the chip map
+        fn = _tpu_rt_get_device()
+        if fn is not None:
+            dev = ctypes.c_int()
+            if fn(ctypes.byref(dev)) == 0:
+                return int(dev.value)
+    except Exception:  # noqa: BLE001
+        pass
+    val = os.environ.get("TPU_VISIBLE_DEVICES", "0")
+    try:
+        return int(val.split(",")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _tpu_rt_get_device():
+    """Resolve ``tpuRtGetDevice`` from the already-mapped runtime, lazily."""
+    global _TPURT_GET_DEVICE
+    if _TPURT_GET_DEVICE is None:
+        try:
+            lib = ctypes.CDLL(None, mode=ctypes.RTLD_GLOBAL)
+            fn = lib.tpuRtGetDevice
+            fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            fn.restype = ctypes.c_int
+            _TPURT_GET_DEVICE = fn
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[TPU] no tpuRtGetDevice (%s); using the env device", exc)
+            _TPURT_GET_DEVICE = False
+    return _TPURT_GET_DEVICE or None
+
+
 def ensure_tpu_device() -> int:
-    """Register the ``"tpu"`` torch device, then return the device index.
+    """Register the ``"tpu"`` torch device, then return its *logical* index.
 
     ``torch.randn(..., device="tpu:0")`` raises "Expected one of cpu, cuda,
     ..." until ``torch_tpu`` has been imported -- that import is what
@@ -126,10 +192,13 @@ def ensure_tpu_device() -> int:
     scripts that build device tensors before touching a kernel must call this
     first; kernel calls themselves work without it only because they allocate
     outputs after the runtime is already initialized.
+
+    The value is the logical id for ``device="tpu:N"``.  Kernels resolve their
+    own (physical) launch device internally -- see :func:`get_tpu_device`.
     """
     import torch_tpu  # noqa: F401  (registers the "tpu" device type)
 
-    return get_tpu_device()
+    return get_torch_device()
 
 
 def _get_ppl_root() -> str:
@@ -1451,7 +1520,7 @@ class PPLKernel:
         a_addr = int(a.data_ptr())
         b_addr = int(b.data_ptr())
         _reassert_tpu_device(self.device)
-        _sync_torch_stream(self.device)
+        _sync_torch_stream()
         if self._launch(self.handle, c_addr, a_addr, b_addr, M, K, N) != 0:
             raise RuntimeError("kernel launch failed")
         self.lib.py_sync_device(self.handle)
@@ -1570,7 +1639,7 @@ class PPLGenericKernel(PPLKernel):
         self._inputs = device_inputs
         try:
             dims_by_name = self._resolve_dims()
-            tpu_device = f"tpu:{self.device}"
+            tpu_device = f"tpu:{get_torch_device()}"
             out_tensors: list[torch.Tensor] = []
             for i, arg in enumerate(self.info.outputs):
                 if i < len(provided):
@@ -1644,7 +1713,7 @@ class PPLGenericKernel(PPLKernel):
         # Also drain torch_tpu's stream: the caller's writes to these buffers
         # were enqueued there, and the PPL launch runs on a different stream.
         _reassert_tpu_device(self.device)
-        _sync_torch_stream(self.device)
+        _sync_torch_stream()
         if self._launch(self.handle, *addrs, *dims) != 0:
             raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
 

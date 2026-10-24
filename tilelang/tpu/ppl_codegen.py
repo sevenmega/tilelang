@@ -62,8 +62,16 @@ from tvm import tirx as _tir
 # dtype mapping                                                                #
 # --------------------------------------------------------------------------- #
 
-_TVM_TO_PPL = {"float16": "fp16", "bfloat16": "bf16", "float32": "fp32"}
-_TVM_TO_TORCH = {"float16": "float16", "bfloat16": "bfloat16", "float32": "float32"}
+_TVM_TO_PPL = {
+    "float16": "fp16", "bfloat16": "bf16", "float32": "fp32",
+    # Index tables for the paged-attention gather: the on-chip copy is int32
+    # (what torch produces) and the gather engine wants uint32.
+    "int32": "int32", "uint32": "uint32",
+}
+_TVM_TO_TORCH = {
+    "float16": "float16", "bfloat16": "bfloat16", "float32": "float32",
+    "int32": "int32", "uint32": "int32",
+}
 _PPL_TO_DT = {"fp16": "DT_FP16", "bf16": "DT_BF16", "fp32": "DT_FP32"}
 
 
@@ -171,11 +179,48 @@ def _render_index(e: Any) -> str:
         return f"{tn.lower()}({_render_index(e.a)}, {_render_index(e.b)})"
     if tn in _BIN_OP:
         return f"({_render_index(e.a)} {_BIN_OP[tn]} {_render_index(e.b)})"
+    if tn == "Call":
+        return _render_extern_call(e)
     # Fall back to the TVM printer (e.g. constant-folded scalars).
     try:
         return str(int(e))
     except (TypeError, ValueError):
         raise NotImplementedError(f"cannot render index expr {tn}: {e}")
+
+
+def _extern_name(call: Any) -> str:
+    """The C symbol of a ``T.call_extern`` call (its first argument)."""
+    arg = call.args[0]
+    return str(getattr(arg, "value", arg))
+
+
+#: Read one ``int`` from a global buffer and use it as a scalar expression.
+#: ``T.call_extern("int32", TL_GREAD_I32, Buf.data, idx)`` renders as
+#: ``get_value<int>(get_gmem_addr(Buf_gt) + (idx) * sizeof(int))``, which is the
+#: documented way to read a scalar on device (a plain ``gtensor[i]`` load is not
+#: supported).  This is what lets a kernel take a per-request quantity -- e.g.
+#: the token offset of request ``b`` -- as an ordinary tensor argument.
+TL_GREAD_I32 = "tl_tpu_gmem_read_i32"
+
+#: Gather ``N`` rows of width ``D`` into an on-chip tile, in-kernel.
+#: ``T.call_extern("handle", TL_GATHER_ROWS, Src.data, Index.data, Dst.data)``
+#: where ``Index`` is an int32/uint32 local tile ``(1, N)`` of row indices into
+#: ``Src`` (a global whose rows are the last two axes) and ``Dst`` is the
+#: ``(N, D)`` local tile to fill.  This is flash-attention's paged/varlen
+#: K/V read: it replaces a driver-side ``cache[tokens]`` gather.
+TL_GATHER_ROWS = "tl_tpu_gather_rows"
+
+
+def _render_extern_call(call: Any) -> str:
+    """Render a ``T.call_extern`` used in an *expression* position."""
+    name = _extern_name(call)
+    if name == TL_GREAD_I32:
+        buf = getattr(call.args[1], "name", str(call.args[1])).split(".")[0]
+        return (
+            f"get_value<int>(get_gmem_addr({buf}_gt) + "
+            f"({_render_index(call.args[2])}) * sizeof(int))"
+        )
+    raise NotImplementedError(f"cannot render extern call {name!r} as an index")
 
 
 def _is_symbolic(e: Any) -> bool:
@@ -283,6 +328,11 @@ class PPLEmitter:
         self.core_for: Any = None
         self._binds: list[Any] = []
         self.partition: tuple[Any, Any] | None = None
+        # Core index name/extent, set by run() when the grid is 3-axis.  Op
+        # lowering that needs per-core scratch (the gather's L2 slices) reads
+        # these; a single-core kernel gets the constant "0" / 1.
+        self.core_var: str = "0"
+        self.core_num: int = 1
 
         # Classify buffers: globals (param buffer_map) vs locals (alloc_buffers).
         self.globals: dict[str, BufArg] = {}
@@ -347,11 +397,19 @@ class PPLEmitter:
 
     @staticmethod
     def _tile_dim4(shape: tuple[int, ...]) -> tuple[int, int, int, int]:
-        """Local compute tile [r,c] -> {1,r,1,c}; [r] -> {1,r,1,1}."""
+        """Local compute tile [r,c] -> {1,r,1,c}; [r] -> {1,r,1,1}.
+
+        A rank-3 ``(r, 1, c)`` tile is the same tile: kernels that copy a
+        ``[rows, D]`` slab out of a 3-D global write it as ``(block_M, 1, D)``
+        so the region's extents line up with the buffer's axes 0 and 2 (see
+        ``flash_attention_paged``), and the on-chip layout is unchanged.
+        """
         if len(shape) == 2:
             return (1, shape[0], 1, shape[1])
         if len(shape) == 1:
             return (1, shape[0], 1, 1)
+        if len(shape) == 3 and int(shape[1]) == 1:
+            return (1, shape[0], 1, shape[2])
         raise NotImplementedError(f"local tile rank {len(shape)} not supported: {shape}")
 
     def tile_dim4(self, name: str) -> tuple[int, int, int, int]:
@@ -425,8 +483,13 @@ class PPLEmitter:
     def _is_global(self, buf: Any) -> bool:
         return buf.name in self.globals and buf.name not in self.locals
 
-    def _subview(self, reg: Region) -> str:
-        """Emit dim4 shape/offset for a global region; return sub_view expr."""
+    def _subview(self, reg: Region) -> tuple[str, str, list[str]]:
+        """Emit dim4 shape/offset for a global region.
+
+        Returns ``(sub_view expr, shape-variable name, permuted extent parts)``
+        so callers can match the on-chip tile to the view's dim4 (see
+        :meth:`_local_tile`).
+        """
         arg = self.globals[reg.buffer.name]
         padoff = self._pad4_prepend([_render_index(i) for i in reg.indices], "0")
         padext = self._pad4_prepend([_render_index(e) for e in reg.extents], "1")
@@ -436,7 +499,48 @@ class PPLEmitter:
         shp_name = self._new_tmp("shp")
         self.emit(f"dim4 {shp_name} = {{{', '.join(lext)}}};")
         self.emit(f"dim4 {off_name} = {{{', '.join(loff)}}};")
-        return f"{reg.buffer.name}_gt.sub_view({shp_name}, {off_name})"
+        return f"{reg.buffer.name}_gt.sub_view({shp_name}, {off_name})", shp_name, lext
+
+    def _local_tile(self, name: str, shp_name: str, lext: list[str]) -> str:
+        """The on-chip tile ``name``, viewed as the region's dim4 if it differs.
+
+        ``dma::load``/``dma::store`` require the tile and the global view to
+        carry the *same* dim4: a mismatched pair does not fail to compile, it
+        hangs the DMA engine on device (verified on hardware), so the shapes are
+        generally made to agree.  A ``[r, c]`` tile is ``{1, r, 1, c}``, which is
+        exactly what a region on a buffer's trailing two axes produces.  The one
+        exception is the C<->H transposition handled below (tile ``{1, R, 1, W}``
+        vs view ``{1, 1, R, W}``), where the view would be *wrong*, not just
+        redundant -- see the comment there.
+        """
+        d4 = self.locals[name][0]
+        d4s = [str(x) for x in d4]
+        lexts = [str(x) for x in lext]
+        if d4s == lexts:
+            return name
+        # Validated C<->H transposition: a ``{1, R, 1, W}`` tile and a
+        # ``{1, 1, R, W}`` global view hold the same R*W elements in the same
+        # row-major order, so ``dma::load`` / ``dma::store`` copy them
+        # element-for-element and the R rows land on the tile's C (lane) axis --
+        # which is exactly how ``tiu::fmm2`` reads the tile.  This happens when a
+        # slab's row axis is *not* the buffer's second-to-last axis: ``Q`` is
+        # ``[Tk, Hq, D]`` and the ``block_M``-row query tile maps to
+        # ``{1, 1, block_M, D}`` on the permuted view while the tile stays
+        # ``{1, block_M, 1, D}``.  Forcing them equal with ``.view()`` instead
+        # would relabel the tile as 1 lane x block_M rows, so only lane 0 (row 0)
+        # lines up with the gemm and every other row is garbage.  Verified on
+        # device in ``probe_g6``; the generic mismatch-hang this guards against
+        # does not apply to this exact transposition.
+        if (
+            len(d4s) == 4 == len(lexts)
+            and d4s[0] == lexts[0] == "1"
+            and d4s[2] == "1"
+            and lexts[1] == "1"
+            and d4s[1] == lexts[2]
+            and d4s[3] == lexts[3]
+        ):
+            return name
+        return f"{name}.view({shp_name})"
 
     # -- statement dispatch ------------------------------------------------ #
 
@@ -501,8 +605,100 @@ class PPLEmitter:
             self.emit_gemm(call)
         elif op == "tl.tileop.reduce":
             self.emit_reduce(call)
+        elif op in ("tir.call_extern", "tirx.call_extern"):
+            self.emit_extern_stmt(call)
         else:
             raise NotImplementedError(f"unhandled tile op: {op}")
+
+    def emit_extern_stmt(self, call: Any) -> None:
+        name = _extern_name(call)
+        if name == TL_GATHER_ROWS:
+            self.emit_gather_rows(call)
+            return
+        raise NotImplementedError(f"unhandled extern statement: {name}")
+
+    # -- in-kernel row gather ---------------------------------------------- #
+
+    def emit_gather_rows(self, call: Any) -> None:
+        """Lower ``TL_GATHER_ROWS`` to an SDMA gather through L2 scratch.
+
+        Recipe (mirrors PPL's ``paged_attention_multicore`` example, verified on
+        device): stage the row-index tile in L2, ``sdma::gather_h`` the rows
+        into an L2 tile, wait for the engine, then DMA the result into the
+        on-chip tile.  ``sdma`` gathers only into L2, and each core needs its own
+        slice of it -- two cores sharing one destination corrupt each other.
+
+        ``N`` (rows) and ``D`` (row width) come from the tiles themselves, so
+        the kernel does not repeat them.
+        """
+        src = getattr(call.args[1], "name", str(call.args[1])).split(".")[0]
+        idx_local = getattr(call.args[2], "name", str(call.args[2]))
+        dst_local = getattr(call.args[3], "name", str(call.args[3]))
+        if src not in self.globals:
+            raise NotImplementedError(f"gather source {src!r} is not a global buffer")
+        if idx_local not in self.locals or dst_local not in self.locals:
+            raise NotImplementedError("gather index/destination must be local tiles")
+
+        rows = int(self.locals[dst_local][0][1])
+        width = int(self.locals[dst_local][0][3])
+        dt = self.locals[dst_local][1]
+        idx_dt = self.locals[idx_local][1]
+        core = self.core_var
+        ncore = self.core_num
+        # Rows are gathered out of the flattened ``[prod(leading), width]``
+        # matrix: the source is e.g. a ``[Slots, Hkv, D]`` cache, so its flat row
+        # count is ``Slots * Hkv`` and ``Idx`` holds ``slot * Hkv + h``.
+        ext = " * ".join(
+            _render_index(s) for s in self.global_bufs[src].shape[:-1]
+        )
+
+        t = self._new_tmp
+        a_idx, a_dst = t("gi"), t("gk")
+        c_idx_sh, c_idx_off = t("gish"), t("gioff")
+        c_dst_sh, c_dst_off = t("gksh"), t("gksh_off")
+        v_idx, v_src, v_dst, v_ld = t("giv"), t("gsv"), t("gdv"), t("gld")
+
+        self.emit(f"dim4 {a_idx} = {{1, 1, 1, {ncore * rows}}};")
+        self.emit(f"gtensor<{idx_dt}> {a_idx}_buf({a_idx}, L2);")
+        self.emit(f"dim4 {c_idx_sh} = {{1, 1, 1, {rows}}};")
+        self.emit(f"dim4 {c_idx_off} = {{0, 0, 0, ({core}) * {rows}}};")
+        self.emit(f"auto {v_idx}_core = {a_idx}_buf.sub_view({c_idx_sh}, {c_idx_off});")
+        self.emit(f"dma::store({v_idx}_core, {idx_local});")
+        self.emit(f"dim4 {v_idx} = {{1, 1, {rows}, 1}};")
+        self.emit(f"auto {v_idx}_view = {v_idx}_core.view({v_idx});")
+
+        self.emit(f"dim4 {a_dst} = {{1, 1, {ncore * rows}, {width}}};")
+        self.emit(f"gtensor<{dt}> {a_dst}_buf({a_dst}, L2);")
+        self.emit(f"dim4 {c_dst_sh} = {{1, 1, {rows}, {width}}};")
+        self.emit(f"dim4 {c_dst_off} = {{0, 0, ({core}) * {rows}, 0}};")
+        self.emit(f"auto {v_dst}_core = {a_dst}_buf.sub_view({c_dst_sh}, {c_dst_off});")
+
+        # The gather source must be a *flat* ``[ext, width]`` gtensor built with
+        # the identity permute, exactly like PPL's own
+        # ``paged_attention_multicore`` example.  Reusing ``{src}_gt`` is wrong:
+        # it was built with the non-trivial codegen order (0,2,1,3) over the
+        # multi-axis cache shape ``[Slots, Hkv, D]``, so ``.view`` addresses the
+        # permuted layout and the gather pulls garbage rows (reads can land on
+        # unmapped memory -> NaN).  A fresh identity-permute gtensor over the raw
+        # pointer gives the plain row-major ``[Slots*Hkv, D]`` the indices assume.
+        src_ptr = self.globals[src].ptr_name
+        src_dt = self.globals[src].ppl_dtype
+        self.emit(f"dim4 {v_src}_mem = {{1, 1, {ext}, {width}}};")
+        self.emit(
+            f"auto {v_src}_cont = make_gtensor_permute<{src_dt}>("
+            f"{v_src}_mem, GLOBAL, {src_ptr});"
+        )
+        self.emit(f"dim4 {v_src} = {{1, 1, {ext}, {width}}};")
+        self.emit(
+            f"auto {v_src}_view = {v_src}_cont.view({v_src}, {{1, {width}, {width}, 1}});"
+        )
+        self.emit(
+            f"sdma::gather_h({v_dst}_core, {v_src}_view, {v_idx}_view, 0.0f);"
+        )
+        self.emit("sync_engine(SDMA | DMA, false);")
+        self.emit(f"dim4 {v_ld} = {{1, {rows}, 1, {width}}};")
+        self.emit(f"auto {v_ld}_view = {v_dst}_core.view({v_ld});")
+        self.emit(f"dma::load({dst_local}, {v_ld}_view);")
 
     # -- copy -------------------------------------------------------------- #
 
@@ -513,11 +709,12 @@ class PPLEmitter:
         dst_g = self._is_global(dst.buffer)
         if src_g and not dst_g:
             self.emit(f"// copy {src.buffer.name} -> {dst.buffer.name} (load)")
-            view = self._subview(src)
-            self.emit(f"dma::load({dst.buffer.name}, {view});")
+            view, shp, lext = self._subview(src)
+            dst_tile = self._local_tile(dst.buffer.name, shp, lext)
+            self.emit(f"dma::load({dst_tile}, {view});")
         elif dst_g and not src_g:
             self.emit(f"// copy {src.buffer.name} -> {dst.buffer.name} (store)")
-            view = self._subview(dst)
+            view, shp, lext = self._subview(dst)
             src_dt = self.locals[src.buffer.name][1]
             dst_dt = self.globals[dst.buffer.name].ppl_dtype
             store_src = src.buffer.name
@@ -530,8 +727,13 @@ class PPLEmitter:
                 self.emit(f"dim4 {bs} = {self._dim4_str(shape)};")
                 self.emit(f"auto {tmp} = make_tensor<{dst_dt}>({bs}, {bs});")
                 self.emit(f"tiu::cast({tmp}, {src.buffer.name});")
+                # Registered so ``_local_tile`` can view it when the store lands
+                # on axes the tile's own dim4 does not describe (see below).
+                self.locals[tmp] = (shape, dst_dt)
                 store_src = tmp
-            self.emit(f"dma::store({view}, {store_src});")
+            self.emit(
+                f"dma::store({view}, {self._local_tile(store_src, shp, lext)});"
+            )
         elif not src_g and not dst_g:
             src_dt = self.locals[src.buffer.name][1]
             dst_dt = self.locals[dst.buffer.name][1]
@@ -891,6 +1093,11 @@ class PPLEmitter:
             core_for = self.core_for
             core_var = core_for.loop_var.name
             core_ext = _render_index(core_for.extent)
+            self.core_var = core_var
+            try:
+                self.core_num = int(core_for.extent)
+            except (TypeError, ValueError):
+                self.core_num = 4
             self.emit("set_block_num_max();", indent_base)
             self.emit(f"const int {core_var} = get_block_index();", indent_base)
             self.emit(f"if ({core_var} >= {core_ext}) return;", indent_base)

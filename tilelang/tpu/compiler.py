@@ -27,6 +27,7 @@ from tilelang.tpu.ppl_runner import (
     PPLGenericKernel,
     PPLGemmSpec,
     PPLKernelInfo,
+    WRAPPER_ABI,
     build,
     build_generic,
     emit_pl,
@@ -325,7 +326,12 @@ def compile(
     info = emit_pl(func, out_idx=out_idx)
 
     if workdir is None:
-        tag = hashlib.md5(info.source.encode()).hexdigest()[:12]
+        # ``WRAPPER_ABI`` is mixed in so a change to the ctypes wrapper's
+        # build layout (link flags, translation unit) invalidates the cached
+        # workdir -- the device-side ``.pl`` is unchanged by such a change.
+        tag = hashlib.md5(
+            f"{WRAPPER_ABI}\0{info.source}".encode()
+        ).hexdigest()[:12]
         workdir = os.path.join("/tmp", f"tilelang_tpu_{info.kernel_name}_{tag}")
     paths = build_generic(info, workdir, **build_kw)
     return TPUKernel(info, paths)
@@ -457,7 +463,8 @@ def compile_gemm(
         nb_tag = f"_nb{num_stages}" if num_stages > 1 else ""
         workdir = os.path.join(
             "/tmp",
-            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}{nb_tag}",
+            f"tilelang_tpu_{kernel_name}_{tag_m}_{tag_k}_{tag_n}{mc_tag}{nb_tag}"
+            f"_{WRAPPER_ABI}",
         )
     paths = build(spec, workdir, **build_kw)
     return TPUGemmKernel(spec, paths)

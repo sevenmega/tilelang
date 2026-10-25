@@ -818,9 +818,25 @@ add_library({kernel_name}_py SHARED {wrapper_src} ${{HOST_SRC_FILES}})
 add_dependencies({kernel_name}_py dynamic_library gen_kernel_module_data_target)
 target_link_libraries({kernel_name}_py PRIVATE tpudnn ${{RUNTIME_LIBS}} pthread ${{ZLIB_LIBRARIES}} ${{EXTRA_LDFLAGS}})
 target_compile_options({kernel_name}_py PRIVATE ${{EXTRA_CFLAGS}})
+# Every kernel exports the SAME symbol names (the PPL entry point is always
+# ``main_kernel``) and is loaded with RTLD_GLOBAL, so without this a second
+# kernel's internal call to ``main_kernel`` binds to the FIRST loaded kernel
+# (the global scope is searched before the object's own definitions).  The
+# second kernel then runs the first kernel's launch code against its own
+# buffers: wrong results, and 100x+ slower.  ``-Bsymbolic`` binds the
+# object's own references to its own definitions, making each wrapper
+# self-contained.
+target_link_options({kernel_name}_py PRIVATE -Wl,-Bsymbolic)
 set_target_properties({kernel_name}_py PROPERTIES PREFIX "" SUFFIX ".so")
 install(TARGETS {kernel_name}_py DESTINATION ${{CMAKE_CURRENT_SOURCE_DIR}}/lib)
 """
+
+
+#: Bump when the wrapper source / CMake layout changes.  It is mixed into the
+#: content-hash that names a kernel's build dir (see ``compiler.py``), so a
+#: change here rebuilds the cached workdirs instead of silently reusing a .so
+#: built with the old layout.
+WRAPPER_ABI = "bsymbolic-1"
 
 
 @dataclass

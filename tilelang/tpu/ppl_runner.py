@@ -8,8 +8,9 @@ canonical reference kernel ``PPLOPs/pplops/ops/gemm_w8a8bf16.pl``:
   2. ``ppl_compile.py --gen_test`` builds ``lib/libkernel.so`` + a host launcher
      (``host/*.cpp``, ``include/*.h``) + a CMakeLists.txt;
   3. append a small ctypes wrapper target (``tl_py.so``) that exposes
-     ``py_init_device / py_sync_device / py_dev_malloc / py_memcpy_h2d /
-     py_memcpy_d2h / py_<kernel>`` and rebuild that target;
+     ``py_init_device / py_init_device_shared / py_sync_device / py_flush /
+     py_dev_malloc / py_memcpy_h2d / py_memcpy_d2h / py_<kernel>`` and rebuild
+     that target;
   4. from Python, ``ctypes``-load ``tl_py.so``, copy torch tensors H2D, launch,
      sync, copy D2H.
 
@@ -85,12 +86,56 @@ def _reassert_tpu_device(device: int) -> None:
         _TPURT_SET_DEVICE(int(device))
 
 
+#: ``PPL_ASYNC_LAUNCH=1`` selects the flush+event launch (see
+#: ``PPLGenericKernel._ordered_launch``).  OFF by default: with a *per-wrapper*
+#: stream it faulted a TPU chip in a model run (see that method's docstring).
+#: It is only safe together with :func:`_ppl_shared_stream`, which every kernel
+#: on the device now shares.
+_ASYNC_LAUNCH = os.environ.get("PPL_ASYNC_LAUNCH", "") not in ("", "0")
+
+#: One torch-owned stream per device, shared by every tilelang kernel on it:
+#: ``device -> (torch.tpu.Stream, raw tpuStream_t)``.
+_PPL_STREAMS: dict[int, tuple[Any, int]] = {}
+
+
+def _ppl_shared_stream(device: int) -> tuple[Any, int] | None:
+    """The one PPL stream every tilelang kernel on ``device`` launches into.
+
+    A wrapper that creates its own stream is invisible to every other wrapper,
+    so two kernels' launches cannot be ordered against each other, and flushing
+    them out of order is what faulted a chip.  Sharing one stream makes the
+    ordering total: a single flush publishes onto the same stream for all of
+    them, exactly as torch_tpu runs (one stream per device, one module per
+    kernel).
+
+    The stream is created by *torch* (``torch.tpu.Stream``), not by
+    ``tpuRtStreamCreate``, so the runtime already knows it: events recorded on
+    it are ordinary stream events (no ``ExternalStream`` wrapper) and the
+    device-wide sync path walks it like any other torch stream.  Returns
+    ``(stream, raw_ptr)``, or ``None`` when torch exposes no ``Stream``, which
+    puts the caller back on a private stream.
+    """
+    cached = _PPL_STREAMS.get(device)
+    if cached is not None:
+        return cached
+    try:
+        _reassert_tpu_device(device)
+        stream = torch.tpu.Stream(device=get_torch_device())
+        ptr = int(stream._as_parameter_.value)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TPU] no shared PPL stream (%s); using a private one", exc)
+        return None
+    _PPL_STREAMS[device] = (stream, ptr)
+    return stream, ptr
+
+
 def _sync_torch_stream() -> None:
     """Order the caller's torch_tpu writes before the PPL launch.
 
     ``torch_tpu`` enqueues its ops (``randn``, ``ones``, ``fill_``, slice
-    assignments, ``copy_``) on *its own* stream.  The PPL wrapper launches on a
-    separate stream created inside ``py_init_device``.  Nothing orders the two,
+    assignments, ``copy_``) on *its own* stream.  The PPL wrapper launches on
+    the PPL stream (shared across kernels, or private to one wrapper when the
+    async launch is off).  Nothing orders the two,
     so without a sync the kernel can read input buffers while the writes that
     filled them are still in flight -- the kernel then computes on uninitialized
     (typically zero) memory and the caller sees zeros, denormals, or NaN.
@@ -764,13 +809,19 @@ _WRAPPER_TEMPLATE = r"""// ctypes-callable wrapper around the generated {kernel_
 
 static tpuRtStream_t g_stream = nullptr;
 static tpuRtKernelModule_t g_module = nullptr;
+// True when g_stream belongs to the caller (py_init_device_shared): the caller
+// owns its lifetime, so this wrapper must not destroy it.
+static bool g_stream_borrowed = false;
 
-extern "C" {{
-
-void *py_init_device(int devid) {{
+// The kernel module is per-.so, but the stream need not be: every tilelang
+// wrapper can share one, which is how torch_tpu itself runs (one stream per
+// device, one module per kernel).  Callers that want cross-kernel ordering pass
+// the same stream to every wrapper.
+static void *init_device_on(int devid, tpuRtStream_t stream) {{
   if (tpuRtInit() != tpuRtSuccess) {{ fprintf(stderr, "tpuRtInit failed\n"); return nullptr; }}
   tpuRtSetDevice(devid);
-  tpuRtStreamCreate(&g_stream);
+  if (stream) {{ g_stream = stream; g_stream_borrowed = true; }}
+  else {{ g_stream_borrowed = false; tpuRtStreamCreate(&g_stream); }}
   const char *kp = getenv("PPL_KERNEL_PATH");
   if (!kp) {{ fprintf(stderr, "PPL_KERNEL_PATH not set\n"); return nullptr; }}
   g_module = tpuRtKernelLoadModuleFile(kp, g_stream);
@@ -778,13 +829,24 @@ void *py_init_device(int devid) {{
   return (void *)tpudnnHandleFromStream(devid, g_stream, g_module);
 }}
 
+extern "C" {{
+
+void *py_init_device(int devid) {{ return init_device_on(devid, nullptr); }}
+void *py_init_device_shared(int devid, void *stream) {{
+  return init_device_on(devid, (tpuRtStream_t)stream);
+}}
+
 void py_release_device(void *h) {{
   if (h) tpudnnDestroy((tpudnnHandle_t)h);
   if (g_module) tpuRtKernelUnloadModule(g_module, g_stream);
-  if (g_stream) {{ tpuRtStreamSynchronize(g_stream); tpuRtStreamDestroy(g_stream); g_stream = nullptr; }}
+  if (g_stream && !g_stream_borrowed) {{
+    tpuRtStreamSynchronize(g_stream); tpuRtStreamDestroy(g_stream);
+  }}
+  g_stream = nullptr; g_module = nullptr; g_stream_borrowed = false;
 }}
 
 void py_sync_device(void *h) {{ if (h) tpudnnSync((tpudnnHandle_t)h); }}
+int py_flush(void *h) {{ return h ? (int)tpudnnFlush((tpudnnHandle_t)h) : -1; }}
 
 unsigned long long py_dev_malloc(unsigned long long size) {{
   void *p = nullptr; tpuRtMalloc(&p, size, 1); return (unsigned long long)p;
@@ -836,7 +898,7 @@ install(TARGETS {kernel_name}_py DESTINATION ${{CMAKE_CURRENT_SOURCE_DIR}}/lib)
 #: content-hash that names a kernel's build dir (see ``compiler.py``), so a
 #: change here rebuilds the cached workdirs instead of silently reusing a .so
 #: built with the old layout.
-WRAPPER_ABI = "bsymbolic-1"
+WRAPPER_ABI = "shared-stream-1"
 
 
 @dataclass
@@ -987,13 +1049,19 @@ def _generic_wrapper_src(kernel_name: str, num_args: int, num_dyn_dims: int = 0)
 
 static tpuRtStream_t g_stream = nullptr;
 static tpuRtKernelModule_t g_module = nullptr;
+// True when g_stream belongs to the caller (py_init_device_shared): the caller
+// owns its lifetime, so this wrapper must not destroy it.
+static bool g_stream_borrowed = false;
 
-extern "C" {{
-
-void *py_init_device(int devid) {{
+// The kernel module is per-.so, but the stream need not be: every tilelang
+// wrapper can share one, which is how torch_tpu itself runs (one stream per
+// device, one module per kernel).  Callers that want cross-kernel ordering pass
+// the same stream to every wrapper.
+static void *init_device_on(int devid, tpuRtStream_t stream) {{
   if (tpuRtInit() != tpuRtSuccess) {{ fprintf(stderr, "tpuRtInit failed\\n"); return nullptr; }}
   tpuRtSetDevice(devid);
-  tpuRtStreamCreate(&g_stream);
+  if (stream) {{ g_stream = stream; g_stream_borrowed = true; }}
+  else {{ g_stream_borrowed = false; tpuRtStreamCreate(&g_stream); }}
   const char *kp = getenv("PPL_KERNEL_PATH");
   if (!kp) {{ fprintf(stderr, "PPL_KERNEL_PATH not set\\n"); return nullptr; }}
   g_module = tpuRtKernelLoadModuleFile(kp, g_stream);
@@ -1001,13 +1069,24 @@ void *py_init_device(int devid) {{
   return (void *)tpudnnHandleFromStream(devid, g_stream, g_module);
 }}
 
+extern "C" {{
+
+void *py_init_device(int devid) {{ return init_device_on(devid, nullptr); }}
+void *py_init_device_shared(int devid, void *stream) {{
+  return init_device_on(devid, (tpuRtStream_t)stream);
+}}
+
 void py_release_device(void *h) {{
   if (h) tpudnnDestroy((tpudnnHandle_t)h);
   if (g_module) tpuRtKernelUnloadModule(g_module, g_stream);
-  if (g_stream) {{ tpuRtStreamSynchronize(g_stream); tpuRtStreamDestroy(g_stream); g_stream = nullptr; }}
+  if (g_stream && !g_stream_borrowed) {{
+    tpuRtStreamSynchronize(g_stream); tpuRtStreamDestroy(g_stream);
+  }}
+  g_stream = nullptr; g_module = nullptr; g_stream_borrowed = false;
 }}
 
 void py_sync_device(void *h) {{ if (h) tpudnnSync((tpudnnHandle_t)h); }}
+int py_flush(void *h) {{ return h ? (int)tpudnnFlush((tpudnnHandle_t)h) : -1; }}
 
 unsigned long long py_dev_malloc(unsigned long long size) {{
   void *p = nullptr; tpuRtMalloc(&p, size, 1); return (unsigned long long)p;
@@ -1435,6 +1514,16 @@ class PPLKernel:
         L.py_init_device.restype = ctypes.c_void_p
         L.py_release_device.argtypes = [ctypes.c_void_p]
         L.py_sync_device.argtypes = [ctypes.c_void_p]
+        # Present in wrappers built from this template onwards; a stale build
+        # dir simply falls back to the drain+sync launch.
+        self._flush = getattr(L, "py_flush", None)
+        self._init_device_shared = getattr(L, "py_init_device_shared", None)
+        if self._init_device_shared is not None:
+            self._init_device_shared.argtypes = [ctypes.c_int, ctypes.c_void_p]
+            self._init_device_shared.restype = ctypes.c_void_p
+        # torch view of the shared PPL stream; re-wrapped if the pointer changes.
+        self._ext_stream = None
+        self._ext_stream_ptr = None
         L.py_dev_malloc.argtypes = [ctypes.c_uint64]
         L.py_dev_malloc.restype = ctypes.c_uint64
         L.py_dev_free.argtypes = [ctypes.c_uint64]
@@ -1456,9 +1545,20 @@ class PPLKernel:
         self._profile_active: bool = False
 
     def init(self) -> None:
-        self.handle = self.lib.py_init_device(self.device)
+        stream = self._shared_stream()
+        if stream is None:
+            self.handle = self.lib.py_init_device(self.device)
+        else:
+            self.handle = self.lib.py_init_device_shared(self.device, stream)
         if not self.handle:
             raise RuntimeError("py_init_device failed (is the TPU device free?)")
+
+    def _shared_stream(self) -> int | None:
+        """The device-wide PPL stream, or ``None`` to use a private one."""
+        if not _ASYNC_LAUNCH or self._init_device_shared is None:
+            return None
+        shared = _ppl_shared_stream(self.device)
+        return None if shared is None else shared[1]
 
     def close(self) -> None:
         if self.handle:
@@ -1472,6 +1572,9 @@ class PPLKernel:
                 self._move_profile_data()
             self.lib.py_release_device(self.handle)
             self.handle = None
+            # Drop the torch view: a re-init may bind a different stream.
+            self._ext_stream = None
+            self._ext_stream_ptr = None
 
     def _move_profile_data(self) -> None:
         """Move ``cdm_profile_data_dev*`` from cwd to ``_profile_dir``."""
@@ -1674,11 +1777,95 @@ class PPLGenericKernel(PPLKernel):
                 dims_by_name,
                 [int(t.data_ptr()) for t in out_tensors],
             )
-            self.lib.py_sync_device(self.handle)
         finally:
             self._inputs = []
 
         return out_tensors[0] if len(out_tensors) == 1 else tuple(out_tensors)
+
+    def _external_stream(self):
+        """torch view of the wrapper's PPL stream, or ``None`` if unavailable.
+
+        Returns ``None`` when the async path is off (``PPL_ASYNC_LAUNCH=1``),
+        the wrapper predates ``py_flush``/``py_init_device_shared``, or the
+        shared stream could not be created -- all of which mean "use the
+        drain+sync launch".
+        """
+        if not _ASYNC_LAUNCH or self._flush is None or self._init_device_shared is None:
+            return None
+        shared = _ppl_shared_stream(self.device)
+        if shared is None:
+            return None
+        stream, ptr = shared
+        self._ext_stream = stream
+        self._ext_stream_ptr = ptr
+        return self._ext_stream
+
+    def _ordered_launch(self, *args) -> int:
+        """Launch so the kernel is ordered against the caller's torch stream.
+
+        torch_tpu enqueues its ops with ``tpuRtLaunchNetAsync`` on the current
+        stream and only fences at ``tpuSynchronizeDevice``; the PPL wrapper
+        launches on a stream of its own.  Two things follow:
+
+        * The caller's writes to the input buffers are *enqueued*, not done, so
+          the PPL stream must wait for the caller's stream (`_sync_torch_stream`
+          waits for all of it -- a full drain, 1 ms short-queue and ~4.5 ms with
+          a model layer queued).  Waiting on an *event* rather than draining is
+          enough, but only after ``torch.tpu.flush``: an event recorded on a
+          stream is ordered against what was submitted to the driver, and
+          ``tpuRtLaunchNetAsync`` stages everything until a flush.  Recording
+          the event on unflushed work lets the kernel read buffers whose writes
+          are still sitting in torch's stage queue -- the fused qkv kernel then
+          reads a stale ``kv_row`` and writes K/V to the *previous* call's
+          slots, which turns the model to garbage (seen in-model; a standalone
+          probe hides it because there the inputs arrive by H2D copies).
+        * A PPL launch is not visible to the runtime until ``tpudnnFlush``, which
+          is exactly what ``tpuSynchronizeDevice`` does before syncing.  Flushing
+          right after the launch publishes the kernel on the wrapper's stream,
+          which lets one event each way replace the drain and the fence.
+
+        The event pair is what the driver's own ops use, so it is not a weaker
+        guarantee: it is the same ordering torch gets, just without a full
+        device drain -- provided both sides are published, hence the
+        ``torch.tpu.flush`` below and the ``py_flush`` after the launch.
+
+        **This needs the shared stream.**  A first attempt that left each
+        wrapper on its own stream (two PPL streams: the fused qkv kernel and the
+        paged-attention kernel) hung a model run 90 s in and left the chip
+        ``Fault`` forever.  Launches staged on two PPL streams are not ordered
+        against each other, and flushing them out of order is the suspected
+        cause.  With :func:`_ppl_shared_stream` every kernel on the device
+        launches into one stream, so one flush publishes all of them in order --
+        the same shape torch_tpu has (one stream per device, many modules).
+
+        **The shared stream must be torch-owned.**  A stream created with
+        ``tpuRtStreamCreate`` and wrapped in ``ExternalStream`` still raced: with
+        the flush above, four in-model trials gave three plausible continuations
+        and one 1.5-nat shifted first two tokens, and a full
+        ``torch.tpu.synchronize()`` *before* the launch did not fix it, so it was
+        not input staleness.  Creating the stream with ``torch.tpu.Stream`` and
+        giving its raw pointer to ``py_init_device_shared`` closed it -- ten
+        consecutive trials then matched the torch chain within its own
+        run-to-run noise.  A torch-owned stream is a normal stream to the
+        runtime, so its events are ordinary stream events rather than
+        ``ExternalStream`` fakes.
+        """
+        ext = self._external_stream()
+        if ext is None:
+            _sync_torch_stream()
+            rc = self._launch(*args)
+            self.lib.py_sync_device(self.handle)
+            return rc
+        cur = torch.tpu.current_stream()
+        # Publish the caller's staged torch work before recording the event;
+        # see the docstring.  Cheap: it submits, it does not wait.
+        torch.tpu.flush()
+        ext.wait_stream(cur)
+        rc = self._launch(*args)
+        if self._flush(self.handle) != 0:
+            raise RuntimeError(f"{self.kernel_name}: tpudnnFlush failed")
+        cur.wait_stream(ext)
+        return rc
 
     def run_device_ptrs(
         self,
@@ -1690,7 +1877,10 @@ class PPLGenericKernel(PPLKernel):
 
         ``input_addrs`` and ``output_addrs`` are raw device pointers in the
         order of ``info.inputs`` and ``info.outputs`` respectively.  The caller
-        owns all allocation and must synchronize after calling this method.
+        owns all allocation.  On return the kernel is ordered against the
+        caller's torch stream (see :meth:`_ordered_launch`): a torch op that
+        reads an output waits for the kernel, and vice versa, so no caller-side
+        sync is needed.
 
         ``dims_by_name`` maps every symbolic dim name (as declared with
         ``T.dynamic``) to its concrete integer value for this invocation; see
@@ -1726,11 +1916,7 @@ class PPLGenericKernel(PPLKernel):
         dims = [dims_by_name[n] for n in self.info.dyn_dims]
         # The caller allocated the output via torch_tpu after its own device
         # sync, which desyncs the runtime; re-assert immediately before launch.
-        # Also drain torch_tpu's stream: the caller's writes to these buffers
-        # were enqueued there, and the PPL launch runs on a different stream.
         _reassert_tpu_device(self.device)
-        _sync_torch_stream()
-        if self._launch(self.handle, *addrs, *dims) != 0:
+        if self._ordered_launch(self.handle, *addrs, *dims) != 0:
             raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
-        self.lib.py_sync_device(self.handle)
 

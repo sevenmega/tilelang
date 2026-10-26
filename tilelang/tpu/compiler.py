@@ -220,8 +220,8 @@ class TPUKernel:
         output_addrs = [int(t.data_ptr()) for t in out_tensors]
         rt.run_device_ptrs(input_addrs, dims_by_name, output_addrs)
         # run_device_ptrs re-asserts the runtime's current device immediately
-        # before the launch, so no caller-side _sync_rt_device is needed.
-        rt.lib.py_sync_device(rt.handle)
+        # before the launch, and leaves the kernel ordered against the caller's
+        # torch stream, so neither a device re-sync nor a fence is needed here.
 
         return out_tensors[0] if len(out_tensors) == 1 else tuple(out_tensors)
 

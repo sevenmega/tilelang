@@ -163,7 +163,11 @@ class TPUKernel:
         rt = self._ensure_runtime()
         info = self.info
 
-        # Resolve dynamic dims from the device input tensor shapes.
+        # Resolve dynamic dims from the device input tensor shapes, then from
+        # any preallocated output the caller supplied.  An output-only dim (a
+        # destination cache whose extent nothing else mentions) is legal as long
+        # as the destination is caller-owned; only a dim that would have to be
+        # guessed to *allocate* a missing output stays an error.
         dims_by_name: dict[str, int] = {}
         for arg, t in zip(info.inputs, inputs):
             for i, s in enumerate(arg.shape):
@@ -177,6 +181,12 @@ class TPUKernel:
                         f"{dims_by_name[name]} and {val} across device inputs"
                     )
                 dims_by_name[name] = val
+        for arg, t in zip(info.outputs, provided_outputs):
+            for i, s in enumerate(arg.shape):
+                name = str(s)
+                if name not in info.dyn_dims or name in dims_by_name:
+                    continue
+                dims_by_name[name] = int(t.shape[i])
         missing = [n for n in info.dyn_dims if n not in dims_by_name]
         if missing:
             raise ValueError(

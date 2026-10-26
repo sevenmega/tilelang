@@ -210,6 +210,15 @@ TL_GREAD_I32 = "tl_tpu_gmem_read_i32"
 #: K/V read: it replaces a driver-side ``cache[tokens]`` gather.
 TL_GATHER_ROWS = "tl_tpu_gather_rows"
 
+#: Scatter ``N`` rows of width ``D`` from an on-chip tile into a global buffer,
+#: in-kernel -- the write side of :data:`TL_GATHER_ROWS`.
+#: ``T.call_extern("handle", TL_SCATTER_ROWS, Dst.data, Index.data, Src.data)``
+#: where ``Dst`` is a global whose rows are the last two axes, ``Index`` is an
+#: int32/uint32 local tile ``(1, N)`` of row indices into ``Dst`` and ``Src`` is
+#: the ``(N, D)`` local tile holding the data.  This is the fused qkv kernel's
+#: KV-cache write: it replaces a driver-side ``cache[tokens] = k`` scatter.
+TL_SCATTER_ROWS = "tl_tpu_scatter_rows"
+
 
 def _render_extern_call(call: Any) -> str:
     """Render a ``T.call_extern`` used in an *expression* position."""
@@ -615,6 +624,9 @@ class PPLEmitter:
         if name == TL_GATHER_ROWS:
             self.emit_gather_rows(call)
             return
+        if name == TL_SCATTER_ROWS:
+            self.emit_scatter_rows(call)
+            return
         raise NotImplementedError(f"unhandled extern statement: {name}")
 
     # -- in-kernel row gather ---------------------------------------------- #
@@ -699,6 +711,90 @@ class PPLEmitter:
         self.emit(f"dim4 {v_ld} = {{1, {rows}, 1, {width}}};")
         self.emit(f"auto {v_ld}_view = {v_dst}_core.view({v_ld});")
         self.emit(f"dma::load({dst_local}, {v_ld}_view);")
+
+    # -- in-kernel row scatter --------------------------------------------- #
+
+    def emit_scatter_rows(self, call: Any) -> None:
+        """Lower ``TL_SCATTER_ROWS`` to an SDMA scatter through L2 scratch.
+
+        The write-side mirror of :meth:`emit_gather_rows`, following the same
+        recipe as PPL's ``paged_attention_multicore`` example (which scatters
+        the updated K/V rows back into the cache from inside the attention
+        kernel): stage the row-index and data tiles in L2 -- one slice per
+        core, because two cores sharing a destination corrupt each other --
+        build a fresh identity-permute gtensor over the *raw* destination
+        pointer, then ``sdma::scatter_h``.  The trailing ``sync_engine`` is not
+        optional here: the L2 slices are reused by the next loop iteration, and
+        scatters are asynchronous, so without it that iteration's ``dma::store``
+        races the in-flight read.
+        """
+        dst = getattr(call.args[1], "name", str(call.args[1])).split(".")[0]
+        idx_local = getattr(call.args[2], "name", str(call.args[2]))
+        src_local = getattr(call.args[3], "name", str(call.args[3]))
+        if dst not in self.globals:
+            raise NotImplementedError(f"scatter destination {dst!r} is not a global buffer")
+        if idx_local not in self.locals or src_local not in self.locals:
+            raise NotImplementedError("scatter index/source must be local tiles")
+
+        rows = int(self.locals[src_local][0][1])
+        width = int(self.locals[src_local][0][3])
+        dt = self.locals[src_local][1]
+        idx_dt = self.locals[idx_local][1]
+        core = self.core_var
+        ncore = self.core_num
+        # Row indices address the flattened ``[prod(leading), width]`` matrix
+        # (e.g. a ``[Slots, Hkv2, 64]`` cache view holds ``Slots * Hkv2`` rows).
+        ext = " * ".join(
+            _render_index(s) for s in self.global_bufs[dst].shape[:-1]
+        )
+
+        t = self._new_tmp
+        a_idx, a_src = t("si"), t("sk")
+        c_idx_sh, c_idx_off = t("sish"), t("sioff")
+        c_src_sh, c_src_off = t("sksh"), t("sksh_off")
+        v_idx, v_src, v_dst, v_st = t("siv"), t("skv"), t("sdv"), t("sst")
+
+        self.emit(f"dim4 {a_idx} = {{1, 1, 1, {ncore * rows}}};")
+        self.emit(f"gtensor<{idx_dt}> {a_idx}_buf({a_idx}, L2);")
+        self.emit(f"dim4 {c_idx_sh} = {{1, 1, 1, {rows}}};")
+        self.emit(f"dim4 {c_idx_off} = {{0, 0, 0, ({core}) * {rows}}};")
+        self.emit(f"auto {v_idx}_core = {a_idx}_buf.sub_view({c_idx_sh}, {c_idx_off});")
+        self.emit(f"dma::store({v_idx}_core, {idx_local});")
+        self.emit(f"dim4 {v_idx} = {{1, 1, {rows}, 1}};")
+        self.emit(f"auto {v_idx}_view = {v_idx}_core.view({v_idx});")
+
+        self.emit(f"dim4 {a_src} = {{1, 1, {ncore * rows}, {width}}};")
+        self.emit(f"gtensor<{dt}> {a_src}_buf({a_src}, L2);")
+        self.emit(f"dim4 {c_src_sh} = {{1, 1, {rows}, {width}}};")
+        self.emit(f"dim4 {c_src_off} = {{0, 0, ({core}) * {rows}, 0}};")
+        self.emit(f"auto {v_src}_core = {a_src}_buf.sub_view({c_src_sh}, {c_src_off});")
+        # The on-chip tile is ``{1, rows, 1, width}``; store it through an L2
+        # view carrying the same dim4 (a mismatched pair hangs the DMA engine),
+        # then hand the H-major slice to the scatter.
+        self.emit(f"dim4 {v_st} = {{1, {rows}, 1, {width}}};")
+        self.emit(f"auto {v_st}_view = {v_src}_core.view({v_st});")
+        self.emit(f"dma::store({v_st}_view, {src_local});")
+
+        # Same reasoning as the gather: the destination must be a *flat*
+        # ``[ext, width]`` gtensor built with the identity permute over the raw
+        # pointer.  ``{dst}_gt`` carries the codegen order (0,2,1,3) over the
+        # multi-axis cache shape, so its rows are not the ones the indices
+        # address.
+        dst_ptr = self.globals[dst].ptr_name
+        dst_dt = self.globals[dst].ppl_dtype
+        self.emit(f"dim4 {v_dst}_mem = {{1, 1, {ext}, {width}}};")
+        self.emit(
+            f"auto {v_dst}_cont = make_gtensor_permute<{dst_dt}>("
+            f"{v_dst}_mem, GLOBAL, {dst_ptr});"
+        )
+        self.emit(f"dim4 {v_dst} = {{1, 1, {ext}, {width}}};")
+        self.emit(
+            f"auto {v_dst}_view = {v_dst}_cont.view({v_dst}, {{1, {width}, {width}, 1}});"
+        )
+        self.emit(
+            f"sdma::scatter_h({v_dst}_view, {v_src}_core, {v_idx}_view, 0, false);"
+        )
+        self.emit("sync_engine(SDMA | DMA, false);")
 
     # -- copy -------------------------------------------------------------- #
 
@@ -847,7 +943,7 @@ class PPLEmitter:
             return self.tile_dim4(e.buffer.name)
         if tn in ("FloatImm", "IntImm"):
             return None
-        if tn == "Call" and _op_name(e).endswith(".exp"):
+        if tn == "Call" and _op_name(e).endswith((".exp", ".rsqrt")):
             return self._expr_shape(e.args[0])
         if tn in ("Add", "Sub", "Mul", "Div", "Max", "Min"):
             sa = self._expr_shape(e.a)
@@ -897,6 +993,13 @@ class PPLEmitter:
             self.emit(f"dim4 {bs} = {self._dim4_str(shape)};")
             self.emit(f"exp_no_overflow({into}, {arg[1]}, &{bs}, &{bs});")
             return
+        if tn == "Call" and _op_name(e).endswith(".rsqrt"):
+            # ``frsqrt`` is a fp32 fixed-point-iteration reciprocal sqrt; the
+            # third argument is the iteration count (default 3).
+            arg = self._gen_value(e.args[0], dtype)
+            assert arg[0] == "tensor", "rsqrt of a scalar is unexpected"
+            self.emit(f"tiu::frsqrt({into}, {arg[1]}, 3);")
+            return
         if tn in ("Add", "Sub", "Mul", "Div", "Max", "Min"):
             self._emit_binary(tn, e.a, e.b, into, dtype)
             return
@@ -910,6 +1013,18 @@ class PPLEmitter:
         raise NotImplementedError(f"cannot emit expression {tn}")
 
     def _emit_binary(self, opn: str, a: Any, b: Any, into: str, dtype: str) -> None:
+        # ``tiu::f*`` reads both operands through their tiles' own dim4 and has
+        # no shape check of its own, so a mismatched pair does not fail to
+        # compile -- it silently reads the wrong elements.  tilelang broadcasts
+        # a size-1 axis and nothing else; enforce exactly that here.
+        sa = self._expr_shape(a)
+        sb = self._expr_shape(b)
+        if sa is not None and sb is not None:
+            for axis, (da, db) in enumerate(zip(sa, sb)):
+                if da != 1 and db != 1 and da != db:
+                    raise NotImplementedError(
+                        f"binary {opn}: dim4 {sa} vs {sb} disagree on axis {axis}; "
+                        "only a size-1 axis broadcasts")
         av = self._gen_value(a, dtype)
         bv = self._gen_value(b, dtype)
         a_scalar = av[0] == "scalar"

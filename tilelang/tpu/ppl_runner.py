@@ -1732,4 +1732,5 @@ class PPLGenericKernel(PPLKernel):
         _sync_torch_stream()
         if self._launch(self.handle, *addrs, *dims) != 0:
             raise RuntimeError(f"{self.kernel_name} device-ptr launch failed")
+        self.lib.py_sync_device(self.handle)
 

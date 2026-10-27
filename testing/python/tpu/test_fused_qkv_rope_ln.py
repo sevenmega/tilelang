@@ -54,6 +54,7 @@ EPS = 1e-6
 LN_EPS = 1e-6
 BLOCK_M = 64
 SLOTS_TOTAL = 256
+REPS = 10
 
 
 def _logical_device() -> int:
@@ -113,6 +114,10 @@ def _ref_model(x, w, gin, gamma, cos_rows):
 def _cmp(name, got, ref, rel_tol=2e-3, assert_ok=True):
     diff = (got.float() - ref.float()).abs()
     rel = (diff.norm() / ref.float().norm().clamp_min(1e-6)).item()
+    # ``cos`` is cosmetic past ~1e7 elements: float32 accumulation there reports
+    # 1.001009 for an *exact* bf16 rounding of the reference (measured at
+    # T=8192), so ``rel`` is the assertion and ``cos`` only catches gross
+    # breakage.  A bf16 output cannot do better than rel ~1.7e-3.
     cos = torch.nn.functional.cosine_similarity(
         got.float().flatten(), ref.float().flatten(), dim=0
     ).item()
@@ -123,12 +128,16 @@ def _cmp(name, got, ref, rel_tol=2e-3, assert_ok=True):
     return ok
 
 
-def _run(kernel, t_tok):
+def _run(kernel, t_tok, block_m=BLOCK_M):
     dev = f"tpu:{_logical_device()}"
     torch.manual_seed(0)
-    tp = -(-t_tok // BLOCK_M) * BLOCK_M
-    s2 = SLOTS_TOTAL * 2 * HKV
-    pad_slot = SLOTS_TOTAL - 1  # the pool's reserved row, excluded from checks
+    tp = -(-t_tok // block_m) * block_m
+    # Every token gets its own slot, so large T needs a large pool; a repeat
+    # would let one token's scatter clobber another's and fail the row check.
+    # One slot past them is reserved as the pad slot.
+    n_slots = max(SLOTS_TOTAL, t_tok + 1)
+    s2 = n_slots * 2 * HKV
+    pad_slot = n_slots - 1  # the pool's reserved row, excluded from checks
 
     x = torch.randn(t_tok, H).to(torch.bfloat16)
     w = (torch.randn(NTOT, H) / H**0.5).to(torch.bfloat16)
@@ -137,7 +146,7 @@ def _run(kernel, t_tok):
     positions = torch.randint(0, 4096, (t_tok,))
     cos_rows = _cos_sin_rows(positions)
 
-    slots = torch.randperm(SLOTS_TOTAL - 1)[:t_tok].int()
+    slots = torch.randperm(n_slots - 1)[:t_tok].int()
     # flat cache row of head h's `half` of token t: slot*2*HKV + 2h + half
     flats = slots.long().unsqueeze(1) * (2 * HKV) + torch.arange(2 * HKV).long()
     kv_row = torch.empty(2 * HKV, tp, dtype=torch.uint32)
@@ -207,14 +216,103 @@ def _run(kernel, t_tok):
     # Padding rows must land on the reserved pad slot and nowhere else.  When T
     # fills the last tile there are none, so the slot stays pristine.
     pad_written = not torch.equal(kc_out[pad_flats], kc0.float()[pad_flats])
-    has_pad = t_tok % BLOCK_M != 0
+    has_pad = t_tok % block_m != 0
     pad_ok = pad_written == has_pad
     print(f"  {'pad slot written (expect %s)' % has_pad:<30}"
           f"{'ok' if pad_ok else 'FAIL':<14}slot={pad_slot}")
     return ok and pad_ok
 
 
+def _bench(kernel, t_tok, block_m):
+    """Mean launch time of ``kernel`` over ``t_tok`` rows."""
+    import time
+
+    dev = f"tpu:{_logical_device()}"
+    torch.manual_seed(0)
+    tp = -(-t_tok // block_m) * block_m
+    n_slots = max(SLOTS_TOTAL, t_tok + 1)
+    s2 = n_slots * 2 * HKV
+    pad_slot = n_slots - 1
+
+    x = torch.randn(t_tok, H).to(torch.bfloat16)
+    w = (torch.randn(NTOT, H) / H**0.5).to(torch.bfloat16)
+    gin = (torch.randn(1, H) * 0.1 + 1.0).to(torch.bfloat16)
+    gamma = (torch.randn(2, D) * 0.5 + 1.0).float()
+    cos_rows = _cos_sin_rows(torch.randint(0, 4096, (t_tok,)))
+    w_folded = (w.float() * gin.reshape(1, -1).float()).to(torch.bfloat16)
+
+    # Slots may repeat here: this path measures time and checks ``q`` only, and
+    # ``q`` does not depend on where the scatter lands.
+    slots = torch.randint(0, n_slots - 1, (t_tok,)).int()
+    flats = slots.long().unsqueeze(1) * (2 * HKV) + torch.arange(2 * HKV).long()
+    kv_row = torch.empty(2 * HKV, tp, dtype=torch.uint32)
+    kv_row[:, :t_tok] = flats.t()
+    kv_row[:, t_tok:] = pad_slot * (2 * HKV) + torch.arange(2 * HKV).view(-1, 1)
+
+    x_src = torch.zeros(tp, H).to(torch.bfloat16)
+    x_src[:t_tok] = x
+    cos_src = torch.zeros(tp, D)
+    cos_src[:t_tok] = cos_rows
+    kc = torch.zeros(s2, HALF).to(torch.bfloat16).to(dev)
+    vc = torch.zeros(s2, HALF).to(torch.bfloat16).to(dev)
+    args = (
+        x_src.to(dev),
+        w_folded.to(dev),
+        cos_src.to(dev),
+        gamma.to(dev),
+        kv_row.to(dev),
+        kc,
+        vc,
+    )
+
+    q = kernel(*args)
+    ref = _ref_kernel_exact(x, w_folded, gamma, cos_rows)[0]
+    cos = torch.nn.functional.cosine_similarity(
+        q.float().cpu()[:t_tok].flatten(), ref.float().flatten(), dim=0
+    ).item()
+
+    torch.tpu.synchronize()
+    start = time.perf_counter()
+    for _ in range(REPS):
+        kernel(*args)
+    torch.tpu.synchronize()
+    return (time.perf_counter() - start) / REPS * 1e3, cos
+
+
+def _sweep(block_ms, ts):
+    import torch_tpu  # noqa: F401  (must precede the first device tensor)
+
+    torch.tpu.set_device(_logical_device())
+    print(f"logical device {torch.tpu.current_device()}")
+    for t_tok in ts:
+        print(f"\n=== T={t_tok} ===")
+        for bm in block_ms:
+            label = f"fused_qkv_rope_ln {bm}"
+            try:
+                kernel = fused_qkv_rope_ln(block_M=bm, dtype="bfloat16", ln_eps=LN_EPS)
+            except Exception as exc:  # local-memory 0x11, bad tile, ...
+                print(f"  {label:<26}BUILD FAILED: {type(exc).__name__}: {exc}")
+                continue
+            try:
+                t_ms, cos = _bench(kernel, t_tok, bm)
+            except Exception as exc:
+                print(f"  {label:<26}LAUNCH FAILED: {type(exc).__name__}: {exc}")
+                continue
+            print(
+                f"  {label:<26}{t_ms:8.3f} ms   "
+                f"cos={cos:.6f}{'' if cos > 0.999 else '   <-- WRONG'}"
+            )
+
+
 def main():
+    if "--sweep" in sys.argv:
+        arg = sys.argv[sys.argv.index("--sweep") + 1]
+        spec = [int(v) for v in arg.split(",")]
+        ts = [int(t) for t in sys.argv[sys.argv.index("--t") + 1].split(",")]
+        print(f"sweep block_M={spec} at T={ts}")
+        _sweep(spec, ts)
+        return 0
+
     do_run = "--run" in sys.argv
 
     # Two launches: T on a tile boundary and T one tile short of one, which is

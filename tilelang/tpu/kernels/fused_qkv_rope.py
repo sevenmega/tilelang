@@ -117,6 +117,7 @@ def fused_qkv_rope(
         return (Hq + Hkv) * D + h * D
 
     groups_per_core = (Hkv + _NUM_CORES - 1) // _NUM_CORES
+    n_hdr = ratio + 2                # q heads + k + v, one accumulator each
 
     @T.prim_func
     def main(
@@ -133,8 +134,23 @@ def fused_qkv_rope(
             x_tile = T.alloc_local((block_M, block_K), dtype)
             w_lo = T.alloc_local((half, block_K), dtype)
             w_hi = T.alloc_local((half, block_K), dtype)
-            acc_lo = T.alloc_local((block_M, half), accum_dtype)
-            acc_hi = T.alloc_local((block_M, half), accum_dtype)
+            # One accumulator pair per head this job owns -- its ``ratio`` query
+            # heads, then its own k and v heads -- all live across one k sweep,
+            # so the X tile is loaded once per k step and shared by every head.
+            #
+            # This replaced a per-head k loop that re-loaded X for each head,
+            # and it is **timing-neutral**: those re-loads were L2 hits, and the
+            # row measured the same before and after at every tile size tried.
+            # It is kept because it collapses three copies of the norm/RoPE
+            # epilogue into one ``_norm_rope``.  What actually moves this kernel
+            # is ``block_M`` -- the GEMM's M -- not the X traffic: at T=8192,
+            # 15.05 ms at block_M=64 vs 5.22 ms at 4096.
+            #
+            # The cost is small: a [block_M, D/2] fp32 tile is
+            # ``ceil(block_M/64) * 64 * 4`` B/lane -- 256 B at block_M=64, 16 KB
+            # at 4096 -- so even the largest tile keeps eight of them in budget.
+            acc_lo = [T.alloc_local((block_M, half), accum_dtype) for _ in range(n_hdr)]
+            acc_hi = [T.alloc_local((block_M, half), accum_dtype) for _ in range(n_hdr)]
             n_lo = T.alloc_local((block_M, half), accum_dtype)
             n_hi = T.alloc_local((block_M, half), accum_dtype)
             # cos / sin are fp32 on purpose: bf16->fp32 `tiu::cast` does not
@@ -163,84 +179,19 @@ def fused_qkv_rope(
 
             g = bc * groups_per_core + bx
             with T.If(g < Hkv), T.Then():
-                for mt in T.serial(TP // block_M):
-                    row0 = mt * block_M
-                    T.copy(CosRows[row0, 0], cos_t)
-                    T.copy(CosRows[row0, half], sin_t)
 
-                    # --- query heads of this KV head ---------------------- #
-                    for s in T.serial(ratio):
-                        qh = g * ratio + s
-                        T.fill(acc_lo, 0)
-                        T.fill(acc_hi, 0)
-                        for kk in T.serial(H // block_K):
-                            k0 = kk * block_K
-                            T.copy(X[row0, k0], x_tile)
-                            T.copy(W[_q_row(qh), k0], w_lo)
-                            gemm_tiled(x_tile, w_lo, acc_lo, transpose_B=True)
-                            T.copy(W[_q_row(qh) + half, k0], w_hi)
-                            gemm_tiled(x_tile, w_hi, acc_hi, transpose_B=True)
+                def _norm_rope(acc_l, acc_h, g_lo, g_hi):
+                    """rstd -> n = x*rstd*gamma -> RoPE, in place in acc_*.
 
-                        # rstd from the full D-wide head, then n = x*rstd*gamma
-                        for i, j in T.Parallel(block_M, half):
-                            sq[i, j] = acc_lo[i, j] * acc_lo[i, j]
-                        T.reduce_sum(sq, ss, dim=1)
-                        for i, j in T.Parallel(block_M, half):
-                            sq[i, j] = acc_hi[i, j] * acc_hi[i, j]
-                        T.reduce_sum(sq, ss, dim=1, clear=False)
-                        for i in T.Parallel(block_M):
-                            var[i] = ss[i] * inv_d
-                        for i in T.Parallel(block_M):
-                            var[i] = var[i] + eps_f
-                        for i in T.Parallel(block_M):
-                            rstd[i] = T.rsqrt(var[i])
-                        for i, j in T.Parallel(block_M, half):
-                            n_lo[i, j] = acc_lo[i, j] * rstd[i]
-                        for i, j in T.Parallel(block_M, half):
-                            n_lo[i, j] = n_lo[i, j] * gq_lo[0, j]
-                        for i, j in T.Parallel(block_M, half):
-                            n_hi[i, j] = acc_hi[i, j] * rstd[i]
-                        for i, j in T.Parallel(block_M, half):
-                            n_hi[i, j] = n_hi[i, j] * gq_hi[0, j]
-
-                        # RoPE.  ``acc_lo`` / ``acc_hi`` are free scratch now
-                        # (their content is in n_*), and they land in a bf16
-                        # tile only through ``T.copy`` -- a bf16 store of an
-                        # fp32 expression needs an explicit Cast.
-                        for i, j in T.Parallel(block_M, half):
-                            acc_lo[i, j] = n_lo[i, j] * cos_t[i, j]
-                        for i, j in T.Parallel(block_M, half):
-                            n_lo[i, j] = n_lo[i, j] * sin_t[i, j]
-                        for i, j in T.Parallel(block_M, half):
-                            acc_hi[i, j] = n_hi[i, j] * cos_t[i, j]
-                        for i, j in T.Parallel(block_M, half):
-                            n_hi[i, j] = n_hi[i, j] * sin_t[i, j]
-                        for i, j in T.Parallel(block_M, half):
-                            acc_lo[i, j] = acc_lo[i, j] - n_hi[i, j]
-                        for i, j in T.Parallel(block_M, half):
-                            acc_hi[i, j] = acc_hi[i, j] + n_lo[i, j]
-
-                        T.copy(acc_lo, out_lo)
-                        T.copy(acc_hi, out_hi)
-                        T.copy(out_lo, QOut[row0, qh * D])
-                        T.copy(out_hi, QOut[row0, qh * D + half])
-
-                    # --- key head ----------------------------------------- #
-                    T.fill(acc_lo, 0)
-                    T.fill(acc_hi, 0)
-                    for kk in T.serial(H // block_K):
-                        k0 = kk * block_K
-                        T.copy(X[row0, k0], x_tile)
-                        T.copy(W[_k_row(g), k0], w_lo)
-                        gemm_tiled(x_tile, w_lo, acc_lo, transpose_B=True)
-                        T.copy(W[_k_row(g) + half, k0], w_hi)
-                        gemm_tiled(x_tile, w_hi, acc_hi, transpose_B=True)
-
+                    Emitted once per head kind; this is a plain Python call that
+                    inlines the statements, not a separate kernel.
+                    """
+                    # rstd from the full D-wide head, then n = x*rstd*gamma
                     for i, j in T.Parallel(block_M, half):
-                        sq[i, j] = acc_lo[i, j] * acc_lo[i, j]
+                        sq[i, j] = acc_l[i, j] * acc_l[i, j]
                     T.reduce_sum(sq, ss, dim=1)
                     for i, j in T.Parallel(block_M, half):
-                        sq[i, j] = acc_hi[i, j] * acc_hi[i, j]
+                        sq[i, j] = acc_h[i, j] * acc_h[i, j]
                     T.reduce_sum(sq, ss, dim=1, clear=False)
                     for i in T.Parallel(block_M):
                         var[i] = ss[i] * inv_d
@@ -249,29 +200,73 @@ def fused_qkv_rope(
                     for i in T.Parallel(block_M):
                         rstd[i] = T.rsqrt(var[i])
                     for i, j in T.Parallel(block_M, half):
-                        n_lo[i, j] = acc_lo[i, j] * rstd[i]
+                        n_lo[i, j] = acc_l[i, j] * rstd[i]
                     for i, j in T.Parallel(block_M, half):
-                        n_lo[i, j] = n_lo[i, j] * gk_lo[0, j]
+                        n_lo[i, j] = n_lo[i, j] * g_lo[0, j]
                     for i, j in T.Parallel(block_M, half):
-                        n_hi[i, j] = acc_hi[i, j] * rstd[i]
+                        n_hi[i, j] = acc_h[i, j] * rstd[i]
                     for i, j in T.Parallel(block_M, half):
-                        n_hi[i, j] = n_hi[i, j] * gk_hi[0, j]
+                        n_hi[i, j] = n_hi[i, j] * g_hi[0, j]
 
+                    # RoPE.  ``acc_*`` are free scratch now (their content is in
+                    # n_*), and they land in a bf16 tile only through ``T.copy``
+                    # -- a bf16 store of an fp32 expression needs an explicit
+                    # Cast.
                     for i, j in T.Parallel(block_M, half):
-                        acc_lo[i, j] = n_lo[i, j] * cos_t[i, j]
+                        acc_l[i, j] = n_lo[i, j] * cos_t[i, j]
                     for i, j in T.Parallel(block_M, half):
                         n_lo[i, j] = n_lo[i, j] * sin_t[i, j]
                     for i, j in T.Parallel(block_M, half):
-                        acc_hi[i, j] = n_hi[i, j] * cos_t[i, j]
+                        acc_h[i, j] = n_hi[i, j] * cos_t[i, j]
                     for i, j in T.Parallel(block_M, half):
                         n_hi[i, j] = n_hi[i, j] * sin_t[i, j]
                     for i, j in T.Parallel(block_M, half):
-                        acc_lo[i, j] = acc_lo[i, j] - n_hi[i, j]
+                        acc_l[i, j] = acc_l[i, j] - n_hi[i, j]
                     for i, j in T.Parallel(block_M, half):
-                        acc_hi[i, j] = acc_hi[i, j] + n_lo[i, j]
+                        acc_h[i, j] = acc_h[i, j] + n_lo[i, j]
 
-                    T.copy(acc_lo, out_lo)
-                    T.copy(acc_hi, out_hi)
+                for mt in T.serial(TP // block_M):
+                    row0 = mt * block_M
+                    T.copy(CosRows[row0, 0], cos_t)
+                    T.copy(CosRows[row0, half], sin_t)
+
+                    for h in range(n_hdr):
+                        T.fill(acc_lo[h], 0)
+                        T.fill(acc_hi[h], 0)
+
+                    # The whole point of the restructure: one activation load per
+                    # k step, consumed by every head this job owns.
+                    for kk in T.serial(H // block_K):
+                        k0 = kk * block_K
+                        T.copy(X[row0, k0], x_tile)
+                        for s in range(ratio):
+                            qrow = _q_row(g * ratio + s)
+                            T.copy(W[qrow, k0], w_lo)
+                            gemm_tiled(x_tile, w_lo, acc_lo[s], transpose_B=True)
+                            T.copy(W[qrow + half, k0], w_hi)
+                            gemm_tiled(x_tile, w_hi, acc_hi[s], transpose_B=True)
+                        T.copy(W[_k_row(g), k0], w_lo)
+                        gemm_tiled(x_tile, w_lo, acc_lo[ratio], transpose_B=True)
+                        T.copy(W[_k_row(g) + half, k0], w_hi)
+                        gemm_tiled(x_tile, w_hi, acc_hi[ratio], transpose_B=True)
+                        T.copy(W[_v_row(g), k0], w_lo)
+                        gemm_tiled(x_tile, w_lo, acc_lo[ratio + 1], transpose_B=True)
+                        T.copy(W[_v_row(g) + half, k0], w_hi)
+                        gemm_tiled(x_tile, w_hi, acc_hi[ratio + 1], transpose_B=True)
+
+                    # --- query heads of this KV head ---------------------- #
+                    for s in range(ratio):
+                        _norm_rope(acc_lo[s], acc_hi[s], gq_lo, gq_hi)
+                        qh = g * ratio + s
+                        T.copy(acc_lo[s], out_lo)
+                        T.copy(acc_hi[s], out_hi)
+                        T.copy(out_lo, QOut[row0, qh * D])
+                        T.copy(out_hi, QOut[row0, qh * D + half])
+
+                    # --- key head ----------------------------------------- #
+                    _norm_rope(acc_lo[ratio], acc_hi[ratio], gk_lo, gk_hi)
+                    T.copy(acc_lo[ratio], out_lo)
+                    T.copy(acc_hi[ratio], out_hi)
 
                     # Cache rows of this head: ``slot * 2 * Hkv + 2 * g + half``.
                     T.copy(KVRow[2 * g, row0], kv_idx)
@@ -286,23 +281,13 @@ def fused_qkv_rope(
                     )
 
                     # --- value head --------------------------------------- #
-                    T.fill(acc_lo, 0)
-                    T.fill(acc_hi, 0)
-                    for kk in T.serial(H // block_K):
-                        k0 = kk * block_K
-                        T.copy(X[row0, k0], x_tile)
-                        T.copy(W[_v_row(g), k0], w_lo)
-                        gemm_tiled(x_tile, w_lo, acc_lo, transpose_B=True)
-                        T.copy(W[_v_row(g) + half, k0], w_hi)
-                        gemm_tiled(x_tile, w_hi, acc_hi, transpose_B=True)
-
-                    T.copy(acc_lo, out_lo)
+                    T.copy(acc_lo[ratio + 1], out_lo)
                     T.copy(KVRow[2 * g, row0], kv_idx)
                     T.call_extern(
                         "handle", "tl_tpu_scatter_rows", Vc.data, kv_idx.data,
                         out_lo.data,
                     )
-                    T.copy(acc_hi, out_hi)
+                    T.copy(acc_hi[ratio + 1], out_hi)
                     T.copy(KVRow[2 * g + 1, row0], kv_idx)
                     T.call_extern(
                         "handle", "tl_tpu_scatter_rows", Vc.data, kv_idx.data,

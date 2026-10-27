@@ -945,6 +945,8 @@ class PPLEmitter:
             return None
         if tn == "Call" and _op_name(e).endswith((".exp", ".rsqrt")):
             return self._expr_shape(e.args[0])
+        if tn == "Cast":
+            return self._expr_shape(e.value)
         if tn in ("Add", "Sub", "Mul", "Div", "Max", "Min"):
             sa = self._expr_shape(e.a)
             sb = self._expr_shape(e.b)
@@ -999,6 +1001,23 @@ class PPLEmitter:
             arg = self._gen_value(e.args[0], dtype)
             assert arg[0] == "tensor", "rsqrt of a scalar is unexpected"
             self.emit(f"tiu::frsqrt({into}, {arg[1]}, 3);")
+            return
+        if tn == "Cast":
+            # Same instruction as the ``T.copy`` narrowing below: bf16->fp32
+            # widening is a plain ``tiu::cast`` (exact, and accepted by
+            # ppl-compile; the ``fmul_cast(dst, src, 1.0f)`` spelling declared
+            # in ``ppl_tiu_func.h`` is rejected as "unsupported arith type").
+            # It is what lets a bf16 tile enter an fp32 expression at all --
+            # ``tiu::fadd``/``fmul`` demand one DataType across all three
+            # tiles, so an implicit widening does not exist.
+            src_dt = str(e.value.dtype)
+            tgt_dt = str(e.dtype)
+            arg = self._gen_value(e.value, dtype)
+            assert arg[0] == "tensor", "cast of a scalar should be folded"
+            if src_dt == tgt_dt:
+                self.emit(f"tiu::move({into}, {arg[1]});")
+            else:
+                self.emit(f"tiu::cast({into}, {arg[1]});")
             return
         if tn in ("Add", "Sub", "Mul", "Div", "Max", "Min"):
             self._emit_binary(tn, e.a, e.b, into, dtype)

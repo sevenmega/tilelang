@@ -23,6 +23,20 @@ set (gate 6.3 + up 6.3 + down 6.3 MB at Qwen3-0.6B), so DRAM traffic is
 ``(row tiles per core) * 18.9 MB``.  Four cores walk the same weight sequence in
 lockstep on different rows, so the concurrent fetches share one stream.
 
+The activation tile is the other end of it.  ``block_K`` is chosen as large as
+``hidden`` allows, so the k loop collapses to a single step and the X tile is
+**loop-invariant across the I sweep**: it is loaded once per row tile, not once
+per (I block, k step).  Left inside the I loop -- as it was when the kernel was
+first tuned -- it is re-read ``I / block_I`` times, 12x at the shipped tiles,
+which is ~190 MB of redundant traffic per layer at T=8192.  Hoisting is free:
+``x_t`` is already a full-row tile, so its local-memory cost is the same either
+way.  It took T=8192 from 4.41 ms to 3.92 ms (1.70x -> 1.87x vs the torch
+chain).
+
+When ``hidden`` is not a multiple of the largest ``block_K`` the driver drops to
+a smaller one, ``k_steps > 1``, and the copy stays in the k loop -- there the
+tile genuinely changes per step.
+
 TPU local memory is accounted per *lane* (256 KB each; a ``{1, r, 1, c}`` tile
 costs ``ceil(r/64) * align(c, 16) * dsize`` bytes), so a ``[512, 1024]`` fp32
 accumulator is 32 KB/lane, not 512 KB.  Large row tiles are affordable, which is
@@ -74,6 +88,11 @@ def fused_mlp(
     I = int(intermediate)
     assert I % block_I == 0, "intermediate must be a multiple of block_I"
     assert H % block_K == 0, "hidden must be a multiple of block_K"
+    # Number of k steps per (gate, up) pair.  When it is one -- the shipped
+    # configuration, since ``block_K`` is chosen as large as ``hidden`` allows --
+    # the X tile does not change between I blocks, so it is loaded once for the
+    # whole sweep instead of once per block.
+    k_steps = H // block_K
 
     @T.prim_func
     def main(
@@ -110,15 +129,22 @@ def fused_mlp(
             with T.If(g < Mt), T.Then():
                 row0 = g * block_M
                 T.fill(d_acc, 0)
+                if k_steps == 1:
+                    # Loop-invariant: fetch the activation tile once and hold it
+                    # across the whole I sweep.  Leaving the copy in the k loop
+                    # below re-reads it I/block_I times -- 12x at the shipped
+                    # tiles, ~190 MB per layer at T=8192 -- and buys nothing.
+                    T.copy(X[row0, 0], x_t)
 
                 for ib in T.serial(I // block_I):
                     i0 = ib * block_I
                     T.fill(g_acc, 0)
                     T.fill(u_acc, 0)
                     # Gate and up share the X tile, so one load per k-step.
-                    for kb in T.serial(H // block_K):
+                    for kb in T.serial(k_steps):
                         k0 = kb * block_K
-                        T.copy(X[row0, k0], x_t)
+                        if k_steps > 1:
+                            T.copy(X[row0, k0], x_t)
                         T.copy(Wgu[i0, k0], w_g)
                         gemm_tiled(x_t, w_g, g_acc, transpose_B=True)
                         T.copy(Wgu[I + i0, k0], w_u)

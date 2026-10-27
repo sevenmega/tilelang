@@ -36,7 +36,7 @@ import torch
 from tilelang.tpu.kernels.fused_mlp import fused_mlp
 
 H, I = 1024, 3072
-BLOCK_SPEC = (128, 128, 256)  # block_M / block_I / block_K for the default build
+BLOCK_SPEC = (1024, 256, 1024)  # block_M / block_I / block_K for the default build
 REPS = 10
 # block_M ladder first: it is the knob that sets the weight-stream traffic.  The
 # full space is only walked when asked for.

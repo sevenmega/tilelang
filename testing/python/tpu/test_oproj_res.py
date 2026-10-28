@@ -42,11 +42,12 @@ H, K = 1024, 2048
 BLOCK_SPEC = (1024, 1024)  # block_M / block_K for the default build
 REPS = 10
 # block_M sets the weight-stream traffic, so it leads; block_K is the reduction
-# tile over `input_size`.  One config per process: a *second* config in the same
-# process never returns from ``py_init_device_shared`` on this runtime -- the
-# chip sits at 0% util while the run blocks, and killing the stuck task can
-# leave the driver needing a reload.  Sweeping more sizes means more processes,
-# one spec each (``--allow-multi`` overrides, for someone studying the hazard).
+# tile over `input_size`.  One spec per process, by default: a second config's
+# ``py_init_device_shared`` blocked once here (chip idle, never returned) while
+# the sglang engine does run several tiles in one process, so the cause is
+# unproven -- the isolation just makes an ambiguous hang cost one run instead of
+# a chip.  Sweeping more sizes means more processes, one spec each
+# (``--allow-multi`` overrides).
 SWEEP_DEFAULT = "1024/1024"
 SWEEP_TS_DEFAULT = "1024,8192"
 
@@ -234,9 +235,9 @@ def main():
         ts = [int(t) for t in ts_s.split(",")]
         if len(spec) > 1 and "--allow-multi" not in sys.argv:
             raise SystemExit(
-                f"{len(spec)} configs in one process: only the first initializes "
-                "on this runtime (see SWEEP_DEFAULT). Run one spec per process, "
-                "or pass --allow-multi if that is what you are testing."
+                f"{len(spec)} configs in one process: run one spec per process "
+                "by default (see SWEEP_DEFAULT), or pass --allow-multi if that "
+                "is what you are testing."
             )
         print(f"sweep {spec} at T={ts}")
         _sweep(spec, ts)

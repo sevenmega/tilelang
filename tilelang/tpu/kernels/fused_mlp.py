@@ -49,9 +49,12 @@ tile extents are baked and cannot be clamped.  Padded rows read garbage from
 ``X`` and produce output the driver drops by slicing ``y[:num_tokens]``.
 
 ``X`` is the *already normalized* hidden state: ``post_attention_layernorm`` runs
-before the MLP, so nothing here needs a norm.  Weights are consumed exactly as
+before the MLP, so nothing here needs a norm.  ``fused_mlp_ln`` is the sibling
+with the opposite contract -- it takes the raw ``hidden + residual`` and
+normalizes on chip.  Weights are consumed exactly as
 stored (``gate_up_proj.weight`` is ``[2I, H]`` with gate first, ``down_proj`` is
-``[H, I]``), through ``transpose_B=True`` -- no driver-side prepacking.
+``[H, I]``), through ``transpose_B=True`` -- no driver-side prepacking; the LN
+sibling is the one exception, and it folds the gamma on the driver.
 """
 
 import tilelang

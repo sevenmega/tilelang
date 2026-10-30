@@ -51,6 +51,7 @@ the input shapes at launch time. Constant extents stay folded as literals.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
 # tilelang must be imported before tvm so the vendored TVM is on the path.
@@ -144,6 +145,32 @@ class PPLKernelInfo:
     @property
     def outputs(self) -> list[BufArg]:
         return [a for a in self.args if a.is_output]
+
+    @cached_property
+    def dyn_slots(self) -> list[list[tuple[int, int]]]:
+        """Per buffer, its ``(extent position, dyn_dims index)`` pairs.
+
+        The launch path has to map every symbolic extent to the value the
+        tensor actually has, on *every* call.  Telling a symbolic extent from a
+        literal means stringifying it, and ``str`` on a TVM extent costs ~10 us,
+        so the naive loop (one lookup per extent of every buffer) was ~60 us of
+        the ~170 us a launch takes on the host -- a third of it, measured on a
+        no-op kernel.  The mapping is a property of the compiled kernel, so it
+        is derived once here and the launch path just walks the pairs.
+        """
+        index = {name: i for i, name in enumerate(self.dyn_dims)}
+        slots: list[list[tuple[int, int]]] = []
+        for arg in self.args:
+            pairs: list[tuple[int, int]] = []
+            for pos, extent in enumerate(arg.shape):
+                # No ``dyn_dims`` is the common case; skip the stringify then.
+                if not index:
+                    break
+                k = index.get(str(extent))
+                if k is not None:
+                    pairs.append((pos, k))
+            slots.append(pairs)
+        return slots
 
 
 # --------------------------------------------------------------------------- #

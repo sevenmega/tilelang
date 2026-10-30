@@ -34,6 +34,8 @@ from tilelang.tpu.ppl_runner import (
     get_tpu_device,
     get_torch_device,
     _collect_profile_data,
+    _concrete_dim,
+    _TORCH_DTYPE,
 )
 from tilelang.transform.lower_tpu_pipeline import lower_tpu_pipeline
 import logging
@@ -85,6 +87,12 @@ class TPUKernel:
         self._runtime: PPLGenericKernel | None = None
         self._last_inputs: list[torch.Tensor] | None = None
         self._profile_config: dict[str, Any] | None = None
+        # Static launch plumbing: which tensor extents feed which symbolic dim.
+        # See ``PPLKernelInfo.dyn_slots`` -- deriving it per launch was a third
+        # of the host-side cost of a kernel launch.
+        slots = info.dyn_slots
+        self._input_dyn_slots = [s for a, s in zip(info.args, slots) if not a.is_output]
+        self._output_dyn_slots = [s for a, s in zip(info.args, slots) if a.is_output]
 
     @property
     def device(self) -> int:
@@ -152,53 +160,57 @@ class TPUKernel:
             self.close()
             return self._launch_device(device_inputs, provided_outputs)
 
+    def _resolve_dims(
+        self,
+        inputs: list[torch.Tensor],
+        provided_outputs: list[torch.Tensor],
+    ) -> dict[str, int]:
+        """Dynamic dims from the tensors actually passed, in one pass per slot.
+
+        An output-only dim (a destination cache whose extent nothing else
+        mentions) is legal as long as the destination is caller-owned; only a
+        dim that would have to be guessed to *allocate* a missing output stays
+        an error.  ``PPLKernelInfo.dyn_slots`` is what keeps this off the
+        stringify path.
+        """
+        info = self.info
+        values: list[int | None] = [None] * len(info.dyn_dims)
+        for t, slots in zip(inputs, self._input_dyn_slots):
+            for pos, k in slots:
+                val = int(t.shape[pos])
+                if values[k] is not None and values[k] != val:
+                    raise ValueError(
+                        f"dynamic dim {info.dyn_dims[k]!r} has conflicting values "
+                        f"{values[k]} and {val} across device inputs"
+                    )
+                values[k] = val
+        for t, slots in zip(provided_outputs, self._output_dyn_slots):
+            for pos, k in slots:
+                if values[k] is None:
+                    values[k] = int(t.shape[pos])
+        missing = [n for n, v in zip(info.dyn_dims, values) if v is None]
+        if missing:
+            raise ValueError(
+                f"unresolved dynamic dim(s) {missing}; check input tensor shapes"
+            )
+        return dict(zip(info.dyn_dims, values))
+
     def _launch_device(
         self,
         inputs: list[torch.Tensor],
         provided_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
         """Resolve dims, allocate any missing outputs on-device, then launch."""
-        from tilelang.tpu.ppl_runner import _TORCH_DTYPE, _concrete_dim
-
         rt = self._ensure_runtime()
         info = self.info
-
-        # Resolve dynamic dims from the device input tensor shapes, then from
-        # any preallocated output the caller supplied.  An output-only dim (a
-        # destination cache whose extent nothing else mentions) is legal as long
-        # as the destination is caller-owned; only a dim that would have to be
-        # guessed to *allocate* a missing output stays an error.
-        dims_by_name: dict[str, int] = {}
-        for arg, t in zip(info.inputs, inputs):
-            for i, s in enumerate(arg.shape):
-                name = str(s)
-                if name not in info.dyn_dims:
-                    continue
-                val = int(t.shape[i])
-                if name in dims_by_name and dims_by_name[name] != val:
-                    raise ValueError(
-                        f"dynamic dim {name!r} has conflicting values "
-                        f"{dims_by_name[name]} and {val} across device inputs"
-                    )
-                dims_by_name[name] = val
-        for arg, t in zip(info.outputs, provided_outputs):
-            for i, s in enumerate(arg.shape):
-                name = str(s)
-                if name not in info.dyn_dims or name in dims_by_name:
-                    continue
-                dims_by_name[name] = int(t.shape[i])
-        missing = [n for n in info.dyn_dims if n not in dims_by_name]
-        if missing:
-            raise ValueError(
-                f"unresolved dynamic dim(s) {missing}; check input tensor shapes"
-            )
+        dims_by_name = self._resolve_dims(inputs, provided_outputs)
 
         # Use caller-supplied outputs where given; allocate the rest on the TPU
         # with torch_tpu's allocator (same VA space as the inputs, so the kernel
         # writes directly into this storage).  This is torch_tpu's *logical*
         # device id -- `self.device` is the PPL runtime's physical id, and
         # torch_tpu maps one to the other.
-        tpu_device = f"tpu:{get_torch_device()}"
+        tpu_device: str | None = None
         out_tensors: list[torch.Tensor] = []
         for i, arg in enumerate(info.outputs):
             if i < len(provided_outputs):
@@ -210,6 +222,8 @@ class TPUKernel:
                     )
                 out_tensors.append(out)
             else:
+                if tpu_device is None:
+                    tpu_device = f"tpu:{get_torch_device()}"
                 shape = tuple(_concrete_dim(s, dims_by_name) for s in arg.shape)
                 dtype = _TORCH_DTYPE[arg.torch_dtype]
                 out_tensors.append(

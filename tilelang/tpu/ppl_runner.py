@@ -1693,38 +1693,39 @@ class PPLGenericKernel(PPLKernel):
         """Map each symbolic dim name to a value from the input shapes.
 
         Called after the inputs have been materialized; ``self._inputs`` holds
-        them in ``info.inputs`` order.  A name is the TIR var (e.g. ``M``);
-        every global buffer carries the same var for the same logical extent,
-        so the first buffer whose shape contains it decides.
+        them in ``info.inputs`` order.  Walks ``info.dyn_slots`` -- the
+        ``(extent position, dim index)`` pairs derived once per kernel -- so no
+        extent is stringified per launch (see that property).
         """
-        found: dict[str, int] = {}
-        for arg, t in zip(self.info.inputs, self._inputs):
+        info = self.info
+        slots_by_input = [s for a, s in zip(info.args, info.dyn_slots)
+                          if not a.is_output]
+        found: list[int | None] = [None] * len(info.dyn_dims)
+        for slots, t in zip(slots_by_input, self._inputs):
             logical = tuple(t.shape)
-            for i, s in enumerate(arg.shape):
-                name = str(s)
-                if name not in self.info.dyn_dims:
-                    continue
-                if i >= len(logical):
+            for pos, k in slots:
+                name = info.dyn_dims[k]
+                if pos >= len(logical):
                     raise ValueError(
-                        f"cannot resolve dim {name!r} from {arg.name} "
-                        f"tensor of shape {logical}")
-                val = int(logical[i])
+                        f"cannot resolve dim {name!r} from a tensor of shape "
+                        f"{logical}")
+                val = int(logical[pos])
                 # A symbolic name may recur across buffers (e.g. B in both Q and
                 # K); every occurrence must agree, else the caller passed
                 # inconsistent shapes and first-buffer-wins would silently pick
                 # one. Fail loudly instead.
-                if name in found and found[name] != val:
+                if found[k] is not None and found[k] != val:
                     raise ValueError(
                         f"dynamic dim {name!r} has conflicting values "
-                        f"{found[name]} and {val} across input buffers for "
+                        f"{found[k]} and {val} across input buffers for "
                         f"kernel {self.kernel_name}; check the input shapes")
-                found[name] = val
-        missing = [n for n in self.info.dyn_dims if n not in found]
+                found[k] = val
+        missing = [n for n, v in zip(info.dyn_dims, found) if v is None]
         if missing:
             raise ValueError(
                 f"unresolved dynamic dim(s) {missing} for kernel "
                 f"{self.kernel_name}; pass tensors whose shapes cover them")
-        return found
+        return dict(zip(info.dyn_dims, found))
 
     def run(self, *inputs: torch.Tensor):
         """Launch with device tensors; allocate outputs on-device, no H2D/D2H.

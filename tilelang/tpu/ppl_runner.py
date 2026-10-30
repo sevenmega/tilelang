@@ -1577,7 +1577,15 @@ class PPLKernel:
             self._ext_stream_ptr = None
 
     def _move_profile_data(self) -> None:
-        """Move ``cdm_profile_data_dev*`` from cwd to ``_profile_dir``."""
+        """Move ``cdm_profile_data_dev*`` from cwd to ``_profile_dir``.
+
+        The dump directory is shared by every handle on the device and written
+        relative to the cwd, so it is recreated empty after the move: when
+        several kernels are armed at once, each one's ``tpudnnDisableProfile``
+        writes into that same path, and a move that removed it made the next
+        disable segfault inside the vendor runtime
+        (``Profile1690::getProfileData`` -> ``__fprintf_chk``).
+        """
         if not self._profile_dir:
             return
         import glob as _glob
@@ -1586,6 +1594,7 @@ class PPLKernel:
             if os.path.exists(dst):
                 shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
             shutil.move(src, dst)
+            os.makedirs(src, exist_ok=True)
 
     def __enter__(self):
         self.init()
